@@ -115,12 +115,6 @@ type chatMessage struct {
 	Content []contentItem `json:"content"`
 }
 
-// chatMessageString is for models that return content as a string
-type chatMessageString struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
 type contentItem struct {
 	Type     string  `json:"type"`
 	Text     string  `json:"text,omitempty"`
@@ -135,7 +129,7 @@ type chatRequest struct {
 	Model        string        `json:"model"`
 	Messages     []chatMessage `json:"messages"`
 	MaxTokens    int           `json:"max_tokens"`
-	Tempertature float32       `json:"temperature"`
+	Temperature  float32       `json:"temperature"`
 }
 
 type chatChoice struct {
@@ -151,6 +145,12 @@ type chatResponseString struct {
 	Choices []struct {
 		Message chatMessageString `json:"message"`
 	} `json:"choices"`
+}
+
+// chatMessageString is for models that return content as a string
+type chatMessageString struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
 func (c *Client) DescribeImage(base64Data string, mimeType string) (string, error) {
@@ -173,10 +173,6 @@ func (c *Client) DescribeImage(base64Data string, mimeType string) (string, erro
 	return "", fmt.Errorf("DescribeImage failed after retries: %w", lastErr)
 }
 
-func (c *Client) LastImageDescription() string {
-	return c.lastImageDesc
-}
-
 func (c *Client) doDescribeImage(base64Data string, mimeType string) error {
 	dataURI := fmt.Sprintf("data:%s;base64,%s", mimeType, base64Data)
 
@@ -191,8 +187,8 @@ func (c *Client) doDescribeImage(base64Data string, mimeType string) error {
 				},
 			},
 		},
-		Tempertature: 0.6,
-		MaxTokens:    32768,
+		Temperature: 0.6,
+		MaxTokens:   32768,
 	}
 
 	body, err := json.Marshal(payload)

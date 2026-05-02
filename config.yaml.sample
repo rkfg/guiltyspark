@@ -1,0 +1,48 @@
+# Matrix Search Bot — Sample Configuration
+# Copy to config.yaml and fill in your values.
+
+bot:
+  homeserver: "https://matrix.example.com"
+  user_id: "@bot:matrix.example.com"
+  access_token: "YOUR_ACCESS_TOKEN"
+  storage_path: "./bot-data"
+
+indexing:
+  # Delayed LLM processing for images — daily time (hour 0-23, minute 0-59)
+  # Default: 05:00. Text indexing happens immediately, LLM (VLM + embedding)
+  # is deferred until this time.
+  delayed_embed_hour: 5
+  delayed_embed_minute: 0
+
+llm:
+  base_url: "https://your-llm-server.example.com/v1"
+  api_key: "YOUR_LLM_API_KEY"
+  embedding_model: "Qwen3 Embedding 8B"
+  image_model: "Qwopus 3.5 4B [VLM]"
+  image_prompt: |
+    Подробно опишите содержимое изображения. Включите все видимые объекты,
+    действия, контекст и весь читаемый текст с картинки. Отвечайте на русском
+    языке, если текст на изображении на английском — процитируйте как есть
+    и дополнительно переведите его на русский в скобках.
+    Полученный текст должен быть достаточно краток
+    и оптимизирован для дальнейшего поиска по нему.
+    Без вступлений, комментариев, поэтической образности и заключений.
+
+search:
+  vector_dimensions: 4096
+  result_limit: 5
+
+image_processing:
+  convert_binary: "convert"
+  output_format: "jpg"
+  output_quality: 85
+  max_long_side: 1280
+  cache_dir: "./cache/images"
+  cache_ttl: 24h
+
+retry:
+  initial_delay: 1s
+  max_delay: 300s
+  multiplier: 2.0
+  max_retries: -1
+  timeout: 60s

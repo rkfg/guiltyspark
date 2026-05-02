@@ -25,10 +25,7 @@ type BotConfig struct {
 }
 
 type IndexingConfig struct {
-	BatchTimeout       time.Duration `yaml:"batch_timeout"`
-	MaxBatchDelay      time.Duration `yaml:"max_batch_delay"`
 	StartupGracePeriod time.Duration `yaml:"startup_grace_period"`
-	Rooms              []string      `yaml:"rooms"`
 	DelayedEmbedHour   int           `yaml:"delayed_embed_hour"`
 	DelayedEmbedMinute int           `yaml:"delayed_embed_minute"`
 }
@@ -106,12 +103,6 @@ func (c *Config) Validate() error {
 	}
 	if c.LLM.ImagePrompt == "" {
 		return fmt.Errorf("llm.image_prompt is required")
-	}
-	if c.Indexing.BatchTimeout == 0 {
-		c.Indexing.BatchTimeout = 60 * time.Second
-	}
-	if c.Indexing.MaxBatchDelay == 0 {
-		c.Indexing.MaxBatchDelay = 10 * time.Minute
 	}
 	if c.Search.VectorDimensions == 0 {
 		c.Search.VectorDimensions = 1536

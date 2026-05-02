@@ -49,7 +49,7 @@ func New(cfg *config.Config) (*Bot, error) {
 	}
 
 	// Create batch indexer
-	batchIndexer := indexer.NewBatchIndexer(cfg.Indexing.BatchTimeout, cfg.Indexing.MaxBatchDelay, cfg.Indexing.DelayedEmbedHour, cfg.Indexing.DelayedEmbedMinute)
+	batchIndexer := indexer.NewBatchIndexer(cfg.Indexing.DelayedEmbedHour, cfg.Indexing.DelayedEmbedMinute)
 
 	// Create image processor
 	imageProcessor := indexer.NewImageProcessor(&cfg.ImageProc, embedClient)
@@ -76,32 +76,6 @@ func New(cfg *config.Config) (*Bot, error) {
 	}
 	batchIndexer.IsIndexedFn = func(eventID string) (bool, error) {
 		return bleveClient.IsEventIndexed(eventID)
-	}
-	batchIndexer.ImageProcFn = func(img indexer.PendingImage) error {
-		result, err := imageProcessor.ProcessImage(img.RawURL, img.RoomID, img.UserID, img.EventID, img.Timestamp, img.RawURL, img.FileName, img.MimeType)
-		if err != nil {
-			return err
-		}
-
-		doc := indexer.IndexedDocument{
-			ID:        fmt.Sprintf("%s:%s", img.RoomID, img.EventID),
-			EventID:   img.EventID,
-			RoomID:    img.RoomID,
-			UserID:    img.UserID,
-			Timestamp: img.Timestamp,
-			EventType: "m.room.message",
-			ImageDesc: result.Description,
-			Vector:    result.Vector,
-			RawURL:    img.RawURL,
-			FileName:  img.FileName,
-			MimeType:  img.MimeType,
-		}
-
-		// Index in Bleve for text search (struct preserves []float32 type)
-		if err := bleveClient.IndexDocumentStruct(doc); err != nil {
-			return err
-		}
-		return nil
 	}
 	batchIndexer.ProcessDeferredFn = func(images []indexer.PendingImage) error {
 		for _, img := range images {

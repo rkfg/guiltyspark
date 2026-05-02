@@ -1,11 +1,8 @@
 package indexer
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 )
@@ -20,34 +17,28 @@ type PendingMessage struct {
 }
 
 type BatchIndexer struct {
-	pendingMessages []PendingMessage
-	pendingImages   []PendingImage
+	pendingImages []PendingImage
 	// deferredImages are images whose LLM processing (VLM + embedding) is deferred
 	// until the daily scheduled time (configurable via delayed_embed_hour/minute).
 	deferredImages []PendingImage
 	// deferredTextEmbed are text messages whose embedding is deferred
 	// until the daily scheduled time.
 	deferredTextEmbed []PendingMessage
-	batchTimeout    time.Duration
-	maxBatchDelay   time.Duration
-	lastMessageTime time.Time
-	firstPendingTime  time.Time
-	mu              sync.Mutex
-	stopCh          chan struct{}
-	doneCh          chan struct{}
+	lastMessageTime   time.Time
+	mu                sync.Mutex
+	stopCh            chan struct{}
+	doneCh            chan struct{}
 
 	// Callbacks
 	IndexTextFn   func(doc IndexedDocument) error
 	IsIndexedFn   func(eventID string) (bool, error)
-	ImageProcFn   func(img PendingImage) error // Process image (download, convert, describe)
 
 	// Deferred processing
 	ProcessDeferredFn       func(images []PendingImage) error
 	ProcessDeferredTextFn   func(texts []PendingMessage) error
 
 	// Channels for non-blocking ingestion
-	msgCh    chan PendingMessage
-	imageCh  chan PendingImage
+	imageCh chan PendingImage
 
 	// Deferred processing scheduler
 	embedHour   int
@@ -64,16 +55,13 @@ type PendingImage struct {
 	MimeType  string
 }
 
-func NewBatchIndexer(batchTimeout, maxBatchDelay time.Duration, embedHour, embedMinute int) *BatchIndexer {
+func NewBatchIndexer(embedHour, embedMinute int) *BatchIndexer {
 	b := &BatchIndexer{
-		batchTimeout:   batchTimeout,
-		maxBatchDelay:  maxBatchDelay,
-		stopCh:         make(chan struct{}),
-		doneCh:         make(chan struct{}),
-		msgCh:          make(chan PendingMessage, 1000),
-		imageCh:        make(chan PendingImage, 1000),
-		embedHour:      embedHour,
-		embedMinute:    embedMinute,
+		stopCh:      make(chan struct{}),
+		doneCh:      make(chan struct{}),
+		imageCh:     make(chan PendingImage, 1000),
+		embedHour:   embedHour,
+		embedMinute: embedMinute,
 	}
 	// Start ingestion goroutine
 	go b.ingestLoop()
@@ -82,15 +70,17 @@ func NewBatchIndexer(batchTimeout, maxBatchDelay time.Duration, embedHour, embed
 	return b
 }
 
-// OnTextMessage is non-blocking — enqueues message via channel
+// OnTextMessage indexes text immediately (no batching).
 func (b *BatchIndexer) OnTextMessage(msg PendingMessage) {
-	select {
-	case b.msgCh <- msg:
-	default:
-	}
+	b.indexTextMessage(msg)
+
+	// Queue for deferred embedding
+	b.mu.Lock()
+	b.deferredTextEmbed = append(b.deferredTextEmbed, msg)
+	b.mu.Unlock()
 }
 
-// OnImageMessage is non-blocking — enqueues message via channel
+// OnImageMessage is non-blocking — enqueues image via channel
 func (b *BatchIndexer) OnImageMessage(img PendingImage) {
 	select {
 	case b.imageCh <- img:
@@ -99,44 +89,17 @@ func (b *BatchIndexer) OnImageMessage(img PendingImage) {
 }
 
 func (b *BatchIndexer) ingestLoop() {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
 	for {
 		select {
-		case msg := <-b.msgCh:
-			b.mu.Lock()
-			b.pendingMessages = append(b.pendingMessages, msg)
-			b.lastMessageTime = time.Now()
-			if len(b.pendingMessages) == 1 && len(b.pendingImages) == 0 {
-				b.firstPendingTime = time.Now()
-			}
-			b.mu.Unlock()
-
 		case img := <-b.imageCh:
 			b.mu.Lock()
 			b.pendingImages = append(b.pendingImages, img)
 			b.lastMessageTime = time.Now()
-			if len(b.pendingMessages) == 0 && len(b.pendingImages) == 1 {
-				b.firstPendingTime = time.Now()
-			}
-			b.mu.Unlock()
-
-		case <-ticker.C:
-			b.mu.Lock()
-			hasPending := len(b.pendingMessages) > 0 || len(b.pendingImages) > 0
-			if hasPending && time.Since(b.lastMessageTime) > b.batchTimeout {
-				b.savePending()
-				b.flush()
-				b.removePending()
-			}
 			b.mu.Unlock()
 
 		case <-b.stopCh:
 			b.mu.Lock()
-			b.savePending()
-			b.flush()
-			b.removePending()
+			b.flushImages()
 			b.mu.Unlock()
 			close(b.doneCh)
 			return
@@ -201,31 +164,16 @@ func (b *BatchIndexer) Stop() {
 	<-b.doneCh
 }
 
-func (b *BatchIndexer) flush() {
-	if len(b.pendingMessages) == 0 && len(b.pendingImages) == 0 {
+func (b *BatchIndexer) flushImages() {
+	if len(b.pendingImages) == 0 {
 		return
 	}
 
-	// Pre-allocate deferred slices to avoid repeated reallocation.
-	deferredText := make([]PendingMessage, 0, len(b.pendingMessages))
-	deferredImages := make([]PendingImage, 0, len(b.pendingImages))
-
-	for _, msg := range b.pendingMessages {
-		b.indexTextMessage(msg)
-		deferredText = append(deferredText, msg)
-	}
-
-	for _, img := range b.pendingImages {
-		deferredImages = append(deferredImages, img)
-	}
-
-	b.deferredTextEmbed = append(b.deferredTextEmbed, deferredText...)
-	b.deferredImages = append(b.deferredImages, deferredImages...)
-
-	// Reuse the underlying arrays instead of allocating new ones.
-	b.pendingMessages = b.pendingMessages[:0]
+	deferredImages := make([]PendingImage, len(b.pendingImages))
+	copy(deferredImages, b.pendingImages)
 	b.pendingImages = b.pendingImages[:0]
-	b.firstPendingTime = time.Time{}
+
+	b.deferredImages = append(b.deferredImages, deferredImages...)
 }
 
 func (b *BatchIndexer) indexTextMessage(msg PendingMessage) {
@@ -254,23 +202,5 @@ func (b *BatchIndexer) indexTextMessage(msg PendingMessage) {
 
 	if err := b.IndexTextFn(doc); err != nil {
 		log.Printf("ERROR batch_indexer: IndexTextFn error for event %s: %v", msg.EventID, err)
-		return
 	}
-}
-
-func (b *BatchIndexer) savePending() {
-	dir := filepath.Join(".", "bot-data", "pending")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return
-	}
-
-	data, _ := json.Marshal(map[string]interface{}{
-		"text":   b.pendingMessages,
-		"images": b.pendingImages,
-	})
-	os.WriteFile(filepath.Join(dir, "pending.json"), data, 0644)
-}
-
-func (b *BatchIndexer) removePending() {
-	os.Remove(filepath.Join(".", "bot-data", "pending", "pending.json"))
 }
