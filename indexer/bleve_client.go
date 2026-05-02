@@ -59,7 +59,7 @@ func (b *BleveClient) IndexDocument(doc IndexedDocument) error {
 	// Use map[string]interface{} to preserve vector type as []float32
 	// When using struct, Bleve serializes via JSON which converts []float32 to []interface{}{float64, ...}
 	// FAISS vector index requires []float32
-	docMap := map[string]interface{}{
+	docMap := map[string]any{
 		"id":          doc.ID,
 		"event_id":    doc.EventID,
 		"room_id":     doc.RoomID,

@@ -25,11 +25,12 @@ type BotConfig struct {
 }
 
 type IndexingConfig struct {
-	BatchTimeout      time.Duration `yaml:"batch_timeout"`
-	MaxBatchDelay     time.Duration `yaml:"max_batch_delay"`
+	BatchTimeout       time.Duration `yaml:"batch_timeout"`
+	MaxBatchDelay      time.Duration `yaml:"max_batch_delay"`
 	StartupGracePeriod time.Duration `yaml:"startup_grace_period"`
-	Rooms             []string      `yaml:"rooms"`
-	BlocklistMode     bool          `yaml:"blocklist_mode"`
+	Rooms              []string      `yaml:"rooms"`
+	DelayedEmbedHour   int           `yaml:"delayed_embed_hour"`
+	DelayedEmbedMinute int           `yaml:"delayed_embed_minute"`
 }
 
 type LLMConfig struct {
@@ -147,6 +148,12 @@ func (c *Config) Validate() error {
 	}
 	if c.StoragePath == "" {
 		c.StoragePath = "./bot-data"
+	}
+	if c.Indexing.DelayedEmbedHour == 0 {
+		c.Indexing.DelayedEmbedHour = 5
+	}
+	if c.Indexing.DelayedEmbedMinute == 0 {
+		c.Indexing.DelayedEmbedMinute = 0
 	}
 	return nil
 }

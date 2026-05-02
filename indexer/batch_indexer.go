@@ -22,6 +22,12 @@ type PendingMessage struct {
 type BatchIndexer struct {
 	pendingMessages []PendingMessage
 	pendingImages   []PendingImage
+	// deferredImages are images whose LLM processing (VLM + embedding) is deferred
+	// until the daily scheduled time (configurable via delayed_embed_hour/minute).
+	deferredImages []PendingImage
+	// deferredTextEmbed are text messages whose embedding is deferred
+	// until the daily scheduled time.
+	deferredTextEmbed []PendingMessage
 	batchTimeout    time.Duration
 	maxBatchDelay   time.Duration
 	lastMessageTime time.Time
@@ -32,14 +38,20 @@ type BatchIndexer struct {
 
 	// Callbacks
 	IndexTextFn   func(doc IndexedDocument) error
-	IndexImageFn  func(doc IndexedDocument, vector []float32, imageDesc string) error
-	EmbedTextFn   func(text string) ([]float32, error)
 	IsIndexedFn   func(eventID string) (bool, error)
 	ImageProcFn   func(img PendingImage) error // Process image (download, convert, describe)
+
+	// Deferred processing
+	ProcessDeferredFn       func(images []PendingImage) error
+	ProcessDeferredTextFn   func(texts []PendingMessage) error
 
 	// Channels for non-blocking ingestion
 	msgCh    chan PendingMessage
 	imageCh  chan PendingImage
+
+	// Deferred processing scheduler
+	embedHour   int
+	embedMinute int
 }
 
 type PendingImage struct {
@@ -52,17 +64,21 @@ type PendingImage struct {
 	MimeType  string
 }
 
-func NewBatchIndexer(batchTimeout, maxBatchDelay time.Duration) *BatchIndexer {
+func NewBatchIndexer(batchTimeout, maxBatchDelay time.Duration, embedHour, embedMinute int) *BatchIndexer {
 	b := &BatchIndexer{
 		batchTimeout:   batchTimeout,
 		maxBatchDelay:  maxBatchDelay,
 		stopCh:         make(chan struct{}),
 		doneCh:         make(chan struct{}),
-		msgCh:          make(chan PendingMessage, 1000), // buffered for non-blocking
-		imageCh:        make(chan PendingImage, 1000),    // buffered for non-blocking
+		msgCh:          make(chan PendingMessage, 1000),
+		imageCh:        make(chan PendingImage, 1000),
+		embedHour:      embedHour,
+		embedMinute:    embedMinute,
 	}
 	// Start ingestion goroutine
 	go b.ingestLoop()
+	// Start deferred processing scheduler
+	go b.deferredProcessingLoop()
 	return b
 }
 
@@ -128,6 +144,58 @@ func (b *BatchIndexer) ingestLoop() {
 	}
 }
 
+// deferredProcessingLoop waits until the configured daily time and processes
+// all deferred images (VLM description + embedding) in one batch.
+func (b *BatchIndexer) deferredProcessingLoop() {
+	for {
+		now := time.Now()
+		next := time.Date(now.Year(), now.Month(), now.Day(),
+			b.embedHour, b.embedMinute, 0, 0, now.Location())
+		if next.Before(now) || next.Equal(now) {
+			next = next.Add(24 * time.Hour)
+		}
+
+		select {
+		case <-time.After(time.Until(next)):
+			b.mu.Lock()
+			if len(b.deferredImages) > 0 {
+				log.Printf("INFO batch_indexer: processing %d deferred images", len(b.deferredImages))
+				if b.ProcessDeferredFn != nil {
+					deferred := make([]PendingImage, len(b.deferredImages))
+					copy(deferred, b.deferredImages)
+					b.deferredImages = b.deferredImages[:0]
+					b.mu.Unlock()
+					if err := b.ProcessDeferredFn(deferred); err != nil {
+						log.Printf("ERROR batch_indexer: deferred processing error: %v", err)
+					}
+				} else {
+					b.mu.Unlock()
+				}
+			} else {
+				b.mu.Unlock()
+			}
+			if len(b.deferredTextEmbed) > 0 {
+				log.Printf("INFO batch_indexer: processing %d deferred text embeddings", len(b.deferredTextEmbed))
+				if b.ProcessDeferredTextFn != nil {
+					deferred := make([]PendingMessage, len(b.deferredTextEmbed))
+					copy(deferred, b.deferredTextEmbed)
+					b.deferredTextEmbed = b.deferredTextEmbed[:0]
+					b.mu.Unlock()
+					if err := b.ProcessDeferredTextFn(deferred); err != nil {
+						log.Printf("ERROR batch_indexer: deferred text embedding error: %v", err)
+					}
+				} else {
+					b.mu.Unlock()
+				}
+			} else {
+				b.mu.Unlock()
+			}
+		case <-b.stopCh:
+			return
+		}
+	}
+}
+
 func (b *BatchIndexer) Stop() {
 	close(b.stopCh)
 	<-b.doneCh
@@ -138,22 +206,29 @@ func (b *BatchIndexer) flush() {
 		return
 	}
 
-	// Process text messages
+	// Pre-allocate deferred slices to avoid repeated reallocation.
+	deferredText := make([]PendingMessage, 0, len(b.pendingMessages))
+	deferredImages := make([]PendingImage, 0, len(b.pendingImages))
+
 	for _, msg := range b.pendingMessages {
-		b.processTextMessage(msg)
+		b.indexTextMessage(msg)
+		deferredText = append(deferredText, msg)
 	}
 
-	// Process images
 	for _, img := range b.pendingImages {
-		b.processImageMessage(img)
+		deferredImages = append(deferredImages, img)
 	}
 
+	b.deferredTextEmbed = append(b.deferredTextEmbed, deferredText...)
+	b.deferredImages = append(b.deferredImages, deferredImages...)
+
+	// Reuse the underlying arrays instead of allocating new ones.
 	b.pendingMessages = b.pendingMessages[:0]
 	b.pendingImages = b.pendingImages[:0]
 	b.firstPendingTime = time.Time{}
 }
 
-func (b *BatchIndexer) processTextMessage(msg PendingMessage) {
+func (b *BatchIndexer) indexTextMessage(msg PendingMessage) {
 	// Check dedup via Bleve
 	if b.IsIndexedFn != nil {
 		indexed, err := b.IsIndexedFn(msg.EventID)
@@ -166,13 +241,7 @@ func (b *BatchIndexer) processTextMessage(msg PendingMessage) {
 		}
 	}
 
-	// Embed text
-	vector, err := b.EmbedTextFn(msg.Text)
-	if err != nil {
-		log.Printf("ERROR batch_indexer: EmbedTextFn error for event %s: %v", msg.EventID, err)
-		return
-	}
-
+	// Immediate Bleve indexing (no embedding — done later)
 	doc := IndexedDocument{
 		ID:        fmt.Sprintf("%s:%s", msg.RoomID, msg.EventID),
 		EventID:   msg.EventID,
@@ -181,33 +250,11 @@ func (b *BatchIndexer) processTextMessage(msg PendingMessage) {
 		Timestamp: msg.Timestamp,
 		EventType: msg.EventType,
 		Text:      msg.Text,
-		Vector:    vector,
 	}
 
 	if err := b.IndexTextFn(doc); err != nil {
 		log.Printf("ERROR batch_indexer: IndexTextFn error for event %s: %v", msg.EventID, err)
 		return
-	}
-}
-
-func (b *BatchIndexer) processImageMessage(img PendingImage) {
-	// Check dedup via Bleve
-	if b.IsIndexedFn != nil {
-		indexed, err := b.IsIndexedFn(img.EventID)
-		if err != nil {
-			log.Printf("ERROR batch_indexer: IsIndexedFn error for image event %s: %v", img.EventID, err)
-			return
-		}
-		if indexed {
-			return
-		}
-	}
-
-	if b.ImageProcFn != nil {
-		if err := b.ImageProcFn(img); err != nil {
-			log.Printf("ERROR batch_indexer: ImageProcFn error for event %s: %v", img.EventID, err)
-			return
-		}
 	}
 }
 
