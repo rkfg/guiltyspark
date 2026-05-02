@@ -2,6 +2,7 @@ package bot
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/rkfg/guiltyspark/indexer"
@@ -9,18 +10,38 @@ import (
 )
 
 var commandAliases = map[string][]string{
-	"search":          {"s", "find", "искать", "поиск"},
-	"search-semantic": {"semantic", "семант", "similarity", "similar", "related"},
+	"search":          {"s", "find", "искать", "поиск", "п"},
+	"search-semantic": {"semantic", "семантик", "сем", "с", "similarity", "similar", "related"},
 	"help":            {"?", "помощь", "h"},
-	"stats":           {"status", "статистика", "info"},
+	"stats":           {"status", "стат", "info"},
 }
 
 func HelpText() string {
-	return `**Available commands:**
-!search <query> — Exact text search (aliases: !s, !find, !поиск, !искать)
-!semantic <query> — Semantic (vector) similarity search (aliases: !semantic, !семант, !similarity, !similar, !related)
-!stats — Show index statistics (aliases: !status, !статистика, !info)
-!help — Show this help message (aliases: !?, !помощь, !h)`
+	commands := []struct {
+		name        string
+		description string
+	}{
+		{"search", "Exact text search"},
+		{"search-semantic", "Semantic (vector) similarity search"},
+		{"stats", "Show index statistics"},
+		{"help", "Show this help message"},
+	}
+
+	var sb strings.Builder
+	sb.WriteString("**Available commands:**\n")
+	for _, cmd := range commands {
+		aliases := commandAliases[cmd.name]
+		if len(aliases) > 0 {
+			aliasStrs := make([]string, len(aliases))
+			for i, a := range aliases {
+				aliasStrs[i] = "!" + a
+			}
+			fmt.Fprintf(&sb, "!%s — %s (aliases: %s)\n", cmd.name, cmd.description, strings.Join(aliasStrs, ", "))
+		} else {
+			fmt.Fprintf(&sb, "!%s — %s\n", cmd.name, cmd.description)
+		}
+	}
+	return sb.String()
 }
 
 // ResolveCommand resolves an alias to the canonical command name.
@@ -44,10 +65,8 @@ func ResolveCommand(cmd string) (string, args string, isCommand bool) {
 
 	// Check if it's an alias
 	for canonical, aliases := range commandAliases {
-		for _, alias := range aliases {
-			if alias == commandName {
-				return canonical, args, true
-			}
+		if slices.Contains(aliases, commandName) {
+			return canonical, args, true
 		}
 	}
 
