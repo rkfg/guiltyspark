@@ -1,0 +1,9 @@
+{
+    "go.buildTags": "vectors",
+    "go.testFlags": ["-tags", "vectors"],
+    "go.lintFlags": ["-tags", "vectors"],
+    "gopls": {
+        "build.buildFlags": ["-tags=vectors"],
+        "ui.semanticTokens": true
+    }
+}

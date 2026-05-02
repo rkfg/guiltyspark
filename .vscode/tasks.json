@@ -1,0 +1,16 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "type": "go",
+            "label": "go: build cmd/bot",
+            "command": "build",
+            "args": ["-tags", "vectors", "-o", "guiltyspark", "./cmd/bot"],
+            "problemMatcher": ["$go"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        }
+    ]
+}
