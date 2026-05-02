@@ -5,6 +5,7 @@ import (
 	"log"
 
 	"github.com/blevesearch/bleve/v2"
+	"github.com/blevesearch/bleve/v2/search/query"
 	index "github.com/blevesearch/bleve_index_api"
 )
 
@@ -18,6 +19,8 @@ func NewBleveClient(indexPath string, vectorDims int) (*BleveClient, error) {
 	textMapping := bleve.NewTextFieldMapping()
 	textMapping.Analyzer = "standard"
 
+	keywordMapping := bleve.NewKeywordFieldMapping()
+
 	// Vector field mapping for kNN search with FAISS (requires -tags vectors)
 	vectorMapping := bleve.NewVectorFieldMapping()
 	vectorMapping.Dims = vectorDims
@@ -27,9 +30,9 @@ func NewBleveClient(indexPath string, vectorDims int) (*BleveClient, error) {
 	// Use DefaultMapping so all fields are indexed by default
 	indexMapping.DefaultMapping.AddFieldMappingsAt("text", textMapping)
 	indexMapping.DefaultMapping.AddFieldMappingsAt("image_desc", textMapping)
-	indexMapping.DefaultMapping.AddFieldMappingsAt("room_id", textMapping)
-	indexMapping.DefaultMapping.AddFieldMappingsAt("user_id", textMapping)
-	indexMapping.DefaultMapping.AddFieldMappingsAt("event_id", textMapping)
+	indexMapping.DefaultMapping.AddFieldMappingsAt("room_id", keywordMapping)
+	indexMapping.DefaultMapping.AddFieldMappingsAt("user_id", keywordMapping)
+	indexMapping.DefaultMapping.AddFieldMappingsAt("event_id", keywordMapping)
 	indexMapping.DefaultMapping.AddFieldMappingsAt("timestamp", bleve.NewNumericFieldMapping())
 	indexMapping.DefaultMapping.AddFieldMappingsAt("event_type", textMapping)
 	indexMapping.DefaultMapping.AddFieldMappingsAt("vector", vectorMapping)
@@ -64,23 +67,26 @@ func (b *BleveClient) IndexDocumentStruct(doc IndexedDocument) error {
 }
 
 func (b *BleveClient) SearchExact(queryText string, roomID string) (*bleve.SearchResult, error) {
+	// Use MatchQuery — it searches only in the specified field
 	textQ := bleve.NewMatchQuery(queryText)
 	textQ.SetField("text")
 
 	imageQ := bleve.NewMatchQuery(queryText)
 	imageQ.SetField("image_desc")
 
-	booleanQ := bleve.NewBooleanQuery()
-	booleanQ.AddShould(textQ)
-	booleanQ.AddShould(imageQ)
+	// Use DisjunctionQuery for OR search across text and image_desc
+	disjQ := bleve.NewDisjunctionQuery(textQ, imageQ)
 
+	var q query.Query
 	if roomID != "" {
 		filterQ := bleve.NewTermQuery(roomID)
 		filterQ.SetField("room_id")
-		booleanQ.AddMust(filterQ)
+		q = bleve.NewConjunctionQuery(disjQ, filterQ)
+	} else {
+		q = disjQ
 	}
 
-	searchReq := bleve.NewSearchRequest(booleanQ)
+	searchReq := bleve.NewSearchRequest(q)
 	searchReq.Size = 50
 	searchReq.Fields = []string{"text", "image_desc", "user_id", "room_id", "timestamp", "event_id", "raw_url", "file_name", "mime_type"}
 
