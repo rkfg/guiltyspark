@@ -39,12 +39,12 @@ go build -tags vectors ./cmd/bot/
 - `!search` — точный текстовый поиск через `DisjunctionQuery` + `ConjunctionQuery` (поля `text`, `image_desc`, фильтр по `room_id` через `TermQuery`)
 - `!semantic` — только семантический поиск (vector similarity)
 - `!stats` — статистика индекса
-- Поддержка фильтров `--room <room_id>` и `--user <user_id>`
+- Поддержка фильтра `--user <user_id>`
 - Команды работают **только в DM** (прямых сообщениях с ботом)
 - Для поиска в конкретной комнате укажите ссылку/алиас в любом месте аргументов:
   ```
-  !search слово #ссылка-на-комноту:server.org
-  !search semantic query !EventID:server.org
+  !search слово #roomname:server.org
+  !search semantic query !roomid:server.org
   ```
   Ссылка автоматически удаляется из текста запроса и резолвится в room ID.
 
@@ -69,5 +69,5 @@ go build -tags vectors ./cmd/bot/
 - Persistence: `deferred.json` сохраняется при каждом сообщении и очищается после обработки
 - Link preview: для сообщений с URL запрашивается превью через API Matrix `GET /_matrix/media/v3/preview_url` (Synapse). Превью добавляются к тексту сообщения как `preview: [title] - description`. Неудавшиеся запросы игнорируются.
 - Команды работают только в DM — это обеспечивает приватность результатов поиска
-- Room alias resolution: `#alias:server` резолвится через `GET /_matrix/client/v3/rooms/{alias}`, `!event:server` — через HTTP запрос к удалённому серверу
-- DM проверка: через `m.direct` account data — бот проверяет, что текущая комната есть в списке прямых сообщений
+- Room alias resolution: `#alias:server` резолвится через `GET /_matrix/client/v3/rooms/{alias}` — через HTTP запрос к серверу
+- DM проверка: через `m.direct` account data — бот проверяет, что текущая комната есть в списке прямых сообщений, либо если в ней менее 3 участников
