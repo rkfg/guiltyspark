@@ -500,7 +500,7 @@ func (b *Bot) handleEvent(ev *event.Event) {
 			Text:      text,
 		}
 
-		b.batchIndexer.OnTextMessage(msg)
+		b.batchIndexer.OnTextMessageWithBuffering(msg)
 	} else if body.MsgType == event.MsgImage {
 		// Index as image message
 		img := indexer.PendingImage{

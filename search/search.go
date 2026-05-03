@@ -333,20 +333,24 @@ func (e *Engine) formatResult(r Result, idx int) (string, string) {
 		fmt.Fprintf(&htmlLine, " <i>score: %.4f</i>", r.Score)
 	}
 
+	// Escape HTML and convert newlines to <br>
+	escapeHTML := func(s string) string {
+		s = strings.ReplaceAll(s, "&", "&amp;")
+		s = strings.ReplaceAll(s, "<", "&lt;")
+		s = strings.ReplaceAll(s, ">", "&gt;")
+		s = strings.ReplaceAll(s, "\n", "<br>")
+		return s
+	}
+
 	if r.Text != "" {
 		truncated := truncate(r.Text, 200)
 		fmt.Fprintf(&textLine, "\n%s\n", truncated)
-		// Escape HTML special chars
-		htmlText := truncated
-		htmlText = strings.ReplaceAll(htmlText, "&", "&amp;")
-		htmlText = strings.ReplaceAll(htmlText, "<", "&lt;")
-		htmlText = strings.ReplaceAll(htmlText, ">", "&gt;")
-		fmt.Fprintf(&htmlLine, "<br>%s<br>", htmlText)
+		fmt.Fprintf(&htmlLine, "<br>%s<br>", escapeHTML(truncated))
 	}
 	if r.ImageDesc != "" {
 		truncated := truncate(r.ImageDesc, 200)
-		fmt.Fprintf(&textLine, "\n\U0001f574\ufe0f %s", truncated)
-		fmt.Fprintf(&htmlLine, "<br>\U0001f574\ufe0f %s", truncated)
+		fmt.Fprintf(&textLine, "\n\U0001f50d %s", truncated)
+		fmt.Fprintf(&htmlLine, "<br>\U0001f50d %s", escapeHTML(truncated))
 	}
 
 	fmt.Fprint(&textLine, "\n")

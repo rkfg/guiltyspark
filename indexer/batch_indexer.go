@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -19,7 +20,20 @@ type PendingMessage struct {
 	Text      string
 }
 
+// messageBuffer accumulates consecutive messages from the same user in the same room.
+type messageBuffer struct {
+	firstEventID string // event ID of the first message in the sequence
+	text         string // accumulated text joined by newlines
+	RoomID       string
+	UserID       string
+	Timestamp    int64
+}
+
 type BatchIndexer struct {
+	// msgBuffer stores accumulated messages by key "roomID|userID".
+	// When a new message arrives from the same key, it replaces the buffer.
+	// When a message arrives from a different key, the old buffer is flushed first.
+	msgBuffer map[string]*messageBuffer
 	// deferredImages are images whose LLM processing (VLM + embedding) is deferred
 	// until the daily scheduled time (configurable via delayed_embed_hour/minute).
 	deferredImages []PendingImage
@@ -63,6 +77,7 @@ const persistFile = "deferred.json"
 
 func NewBatchIndexer(embedHour, embedMinute int) *BatchIndexer {
 	b := &BatchIndexer{
+		msgBuffer:   make(map[string]*messageBuffer),
 		stopCh:      make(chan struct{}),
 		imageCh:     make(chan PendingImage, 1000),
 		embedHour:   embedHour,
@@ -152,6 +167,103 @@ func (b *BatchIndexer) OnTextMessage(msg PendingMessage) {
 	}
 	b.mu.Unlock()
 	b.saveDeferred()
+}
+
+// bufferKey creates a unique key for the message buffer based on room and user.
+func bufferKey(roomID, userID string) string {
+	return roomID + "|" + userID
+}
+
+// OnTextMessageWithBuffering accumulates consecutive messages from the same user in the same room.
+// Each (roomID, userID) pair has its own independent buffer.
+// First message: index immediately. Second message from same key: append text, re-index with first event ID (overwrites).
+func (b *BatchIndexer) OnTextMessageWithBuffering(msg PendingMessage) {
+	b.mu.Lock()
+	
+	key := bufferKey(msg.RoomID, msg.UserID)
+	
+	if existing, exists := b.msgBuffer[key]; exists {
+		// Same (room, user) — append text and re-index with first event ID (overwrites old doc)
+		existing.text = existing.text + "\n" + msg.Text
+		existing.Timestamp = msg.Timestamp
+		b.reindexBufferLocked(existing)
+		delete(b.msgBuffer, key)
+	} else {
+		// New (room, user) pair — create buffer
+		b.msgBuffer[key] = &messageBuffer{
+			firstEventID: msg.EventID,
+			text:         msg.Text,
+			RoomID:       msg.RoomID,
+			UserID:       msg.UserID,
+			Timestamp:    msg.Timestamp,
+		}
+		// Index immediately (first message)
+		b.flushBufferLocked(b.msgBuffer[key])
+	}
+	
+	b.mu.Unlock()
+	b.saveDeferred()
+}
+
+// flushBufferLocked indexes the accumulated buffer and queues it for deferred embedding.
+// Must be called with b.mu held. Does NOT call saveDeferred — caller must do that after unlocking.
+func (b *BatchIndexer) flushBufferLocked(buf *messageBuffer) {
+	// Create a PendingMessage with the accumulated text and first event ID
+	msg := PendingMessage{
+		EventID:   buf.firstEventID,
+		RoomID:    buf.RoomID,
+		UserID:    buf.UserID,
+		Timestamp: buf.Timestamp,
+		EventType: "m.room.message",
+		Text:      buf.text,
+	}
+	b.indexTextMessage(msg)
+
+	// Queue for deferred embedding
+	if !b.hasDeferredText(buf.firstEventID) {
+		b.deferredTextEmbed = append(b.deferredTextEmbed, msg)
+	}
+}
+
+// reindexBufferLocked re-indexes the accumulated buffer with the same event ID (overwrites old doc).
+// Skips dedup check since we're replacing an existing document.
+// Must be called with b.mu held. Does NOT call saveDeferred — caller must do that after unlocking.
+func (b *BatchIndexer) reindexBufferLocked(buf *messageBuffer) {
+	// Create a PendingMessage with the accumulated text and first event ID
+	msg := PendingMessage{
+		EventID:   buf.firstEventID,
+		RoomID:    buf.RoomID,
+		UserID:    buf.UserID,
+		Timestamp: buf.Timestamp,
+		EventType: "m.room.message",
+		Text:      buf.text,
+	}
+
+	// Re-index directly (skip dedup check — we're overwriting)
+	doc := IndexedDocument{
+		ID:        fmt.Sprintf("%s:%s", msg.RoomID, msg.EventID),
+		EventID:   msg.EventID,
+		RoomID:    msg.RoomID,
+		UserID:    msg.UserID,
+		Timestamp: msg.Timestamp,
+		EventType: msg.EventType,
+		Text:      msg.Text,
+	}
+
+	if err := b.IndexTextFn(doc); err != nil {
+		log.Printf("ERROR batch_indexer: reindex error for event %s: %v", msg.EventID, err)
+	} else {
+		log.Printf("INFO batch_indexer: re-indexed text event %s (%d lines)", msg.EventID, strings.Count(msg.Text, "\n")+1)
+	}
+
+	// Update deferred embedding queue — remove old entry and add new
+	for i, pending := range b.deferredTextEmbed {
+		if pending.EventID == buf.firstEventID {
+			b.deferredTextEmbed = append(b.deferredTextEmbed[:i], b.deferredTextEmbed[i+1:]...)
+			break
+		}
+	}
+	b.deferredTextEmbed = append(b.deferredTextEmbed, msg)
 }
 
 // OnImageMessage is non-blocking — enqueues image via channel (with dedup).
