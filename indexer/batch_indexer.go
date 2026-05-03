@@ -36,8 +36,9 @@ type BatchIndexer struct {
 	IsIndexedFn func(eventID string) (bool, error)
 
 	// Deferred processing
-	ProcessDeferredFn     func(images []PendingImage) error
-	ProcessDeferredTextFn func(texts []PendingMessage) error
+	// ProcessDeferredFn processes deferred images and returns list of failed items to retry
+	ProcessDeferredFn     func(images []PendingImage) ([]PendingImage, error)
+	ProcessDeferredTextFn func(texts []PendingMessage) ([]PendingMessage, error)
 
 	// Channels for non-blocking ingestion
 	imageCh chan PendingImage
@@ -214,38 +215,45 @@ func (b *BatchIndexer) deferredProcessingLoop() {
 		select {
 		case <-time.After(time.Until(next)):
 			b.mu.Lock()
-			var deferredImages []PendingImage
-			if len(b.deferredImages) > 0 {
-				deferredImages = make([]PendingImage, len(b.deferredImages))
-				copy(deferredImages, b.deferredImages)
-				b.deferredImages = b.deferredImages[:0]
-			}
-			var deferredText []PendingMessage
-			if len(b.deferredTextEmbed) > 0 {
-				deferredText = make([]PendingMessage, len(b.deferredTextEmbed))
-				copy(deferredText, b.deferredTextEmbed)
-				b.deferredTextEmbed = b.deferredTextEmbed[:0]
-			}
+			// Copy all deferred items for processing
+			deferredImages := make([]PendingImage, len(b.deferredImages))
+			copy(deferredImages, b.deferredImages)
+			deferredText := make([]PendingMessage, len(b.deferredTextEmbed))
+			copy(deferredText, b.deferredTextEmbed)
 			b.mu.Unlock()
 
+			var failedImages []PendingImage
+			var failedText []PendingMessage
+
+			// Process deferred images
 			if len(deferredImages) > 0 {
 				log.Printf("INFO batch_indexer: processing %d deferred images", len(deferredImages))
 				if b.ProcessDeferredFn != nil {
-					if err := b.ProcessDeferredFn(deferredImages); err != nil {
-						log.Printf("ERROR batch_indexer: deferred processing error: %v", err)
-					}
-				}
-			}
-			if len(deferredText) > 0 {
-				log.Printf("INFO batch_indexer: processing %d deferred text embeddings", len(deferredText))
-				if b.ProcessDeferredTextFn != nil {
-					if err := b.ProcessDeferredTextFn(deferredText); err != nil {
-						log.Printf("ERROR batch_indexer: deferred text embedding error: %v", err)
+					var err error
+					failedImages, err = b.ProcessDeferredFn(deferredImages)
+					if err != nil {
+						log.Printf("ERROR batch_indexer: deferred images processing error: %v", err)
 					}
 				}
 			}
 
-			// Clear persisted deferred data after processing
+			// Process deferred text embeddings
+			if len(deferredText) > 0 {
+				log.Printf("INFO batch_indexer: processing %d deferred text embeddings", len(deferredText))
+				if b.ProcessDeferredTextFn != nil {
+					var err error
+					failedText, err = b.ProcessDeferredTextFn(deferredText)
+					if err != nil {
+						log.Printf("ERROR batch_indexer: deferred text processing error: %v", err)
+					}
+				}
+			}
+
+			// Update queues and save once
+			b.mu.Lock()
+			b.deferredImages = failedImages
+			b.deferredTextEmbed = failedText
+			b.mu.Unlock()
 			b.saveDeferred()
 		case <-b.stopCh:
 			return
