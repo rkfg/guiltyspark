@@ -46,3 +46,12 @@ retry:
   multiplier: 2.0
   max_retries: -1
   timeout: 60s
+
+# Link preview configuration
+# Enabled: fetch preview (title, description) for URLs in messages
+# Timeout: max time per URL request
+# MaxURLs: max number of URLs to process per message
+link_preview:
+  enabled: true
+  timeout: 5s
+  max_urls: 5

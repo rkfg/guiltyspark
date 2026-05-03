@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"regexp"
+	"strings"
+	"sync"
 	"time"
 
 	"maunium.net/go/mautrix"
@@ -243,13 +246,46 @@ func (b *Bot) handleEvent(ev *event.Event) {
 		}
 
 		// Index as text message (non-command text)
+		text := body.Body
+
+		// Add link previews if enabled
+		if b.cfg.LinkPreview.Enabled {
+			urls := extractURLs(text, b.cfg.LinkPreview.MaxURLs)
+			if len(urls) > 0 {
+				ctx, cancel := context.WithTimeout(context.Background(), b.cfg.LinkPreview.Timeout)
+				defer cancel()
+
+				var wg sync.WaitGroup
+				mu := sync.Mutex{}
+				var previews []*event.LinkPreview
+
+				for _, u := range urls {
+					wg.Add(1)
+					go func(rawURL string) {
+						defer wg.Done()
+						preview, err := b.client.GetURLPreview(ctx, rawURL)
+						if err != nil {
+							log.Printf("Failed to get preview for %s: %v", rawURL, err)
+							return
+						}
+						mu.Lock()
+						previews = append(previews, preview)
+						mu.Unlock()
+					}(u)
+				}
+
+				wg.Wait()
+				text = buildTextWithPreviews(text, previews)
+			}
+		}
+
 		msg := indexer.PendingMessage{
 			EventID:   ev.ID.String(),
 			RoomID:    ev.RoomID.String(),
 			UserID:    ev.Sender.String(),
 			Timestamp: ev.Timestamp,
 			EventType: "m.room.message",
-			Text:      body.Body,
+			Text:      text,
 		}
 
 		b.batchIndexer.OnTextMessage(msg)
@@ -267,6 +303,47 @@ func (b *Bot) handleEvent(ev *event.Event) {
 
 		b.batchIndexer.OnImageMessage(img)
 	}
+}
+
+var urlRegex = regexp.MustCompile(`https?://[^\s<>"\)\]}]+`)
+
+// extractURLs извлекает уникальные URL из текста, возвращает не больше maxURLs.
+func extractURLs(text string, maxURLs int) []string {
+	matches := urlRegex.FindAllString(text, -1)
+	seen := make(map[string]bool)
+	var urls []string
+	for _, m := range matches {
+		// Clean up trailing punctuation
+		m = strings.TrimRight(m, ".,;:!?)]}")
+		if seen[m] {
+			continue
+		}
+		urls = append(urls, m)
+		if len(urls) >= maxURLs {
+			break
+		}
+	}
+	return urls
+}
+
+// buildTextWithPreviews добавляет текст превью к сообщению.
+func buildTextWithPreviews(text string, previews []*event.LinkPreview) string {
+	if len(previews) == 0 {
+		return text
+	}
+
+	var sb strings.Builder
+	sb.WriteString(text)
+
+	for _, p := range previews {
+		fmt.Fprintf(&sb, "\npreview: [%s]", p.Title)
+		if p.Description != "" {
+			sb.WriteString(" - ")
+			sb.WriteString(p.Description)
+		}
+	}
+
+	return sb.String()
 }
 
 func (b *Bot) sendReply(roomID id.RoomID, parentEventID id.EventID, text string) {

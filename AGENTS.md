@@ -48,6 +48,9 @@ go build -tags vectors ./cmd/bot/
 - `indexing.delayed_embed_hour/minute` — время ночной LLM-обработки (по умолчанию 05:00)
 - `search.vector_dimensions` — размерность векторов (обычно 4096 для Qwen3)
 - `image_processing.*` — параметры ImageMagick
+- `link_preview.enabled` — включать извлечение превью для ссылок в сообщениях
+- `link_preview.timeout` — таймаут запроса превью (по умолчанию 5s)
+- `link_preview.max_urls` — макс. количество ссылок на сообщение (по умолчанию 5)
 
 ## Known quirks
 
@@ -57,3 +60,4 @@ go build -tags vectors ./cmd/bot/
 - Команды не индексируются
 - `sync.Mutex` для данных (`mu`) и `sync.Mutex` для save операций (`saveMu`) — раздельные мьютексы для избежания dead-lock
 - Persistence: `deferred.json` сохраняется при каждом сообщении и очищается после обработки
+- Link preview: для сообщений с URL запрашивается превью через API Matrix `GET /_matrix/media/v3/preview_url` (Synapse). Превью добавляются к тексту сообщения как `preview: [title] - description`. Неудавшиеся запросы игнорируются.

@@ -15,6 +15,7 @@ type Config struct {
 	Search       SearchConfig       `yaml:"search"`
 	ImageProc    ImageProcConfig    `yaml:"image_processing"`
 	Retry        RetryConfig        `yaml:"retry"`
+	LinkPreview  LinkPreviewConfig `yaml:"link_preview"`
 	StoragePath  string             `yaml:"storage_path"`
 }
 
@@ -42,6 +43,12 @@ type LLMConfig struct {
 type SearchConfig struct {
 	VectorDimensions int `yaml:"vector_dimensions"`
 	ResultLimit      int `yaml:"result_limit"`
+}
+
+type LinkPreviewConfig struct {
+	Enabled   bool          `yaml:"enabled"`
+	Timeout   time.Duration `yaml:"timeout"`
+	MaxURLs   int           `yaml:"max_urls"`
 }
 
 type ImageProcConfig struct {
@@ -136,6 +143,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Retry.Timeout == 0 {
 		c.Retry.Timeout = 60 * time.Second
+	}
+	if c.LinkPreview.Timeout == 0 {
+		c.LinkPreview.Timeout = 5 * time.Second
+	}
+	if c.LinkPreview.MaxURLs == 0 {
+		c.LinkPreview.MaxURLs = 5
 	}
 	if c.StoragePath == "" {
 		c.StoragePath = "./bot-data"
