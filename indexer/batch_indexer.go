@@ -29,7 +29,7 @@ type BatchIndexer struct {
 	mu                sync.Mutex
 	saveMu            sync.Mutex
 	stopCh            chan struct{}
-	doneCh            chan struct{}
+	wg                sync.WaitGroup
 
 	// Callbacks
 	IndexTextFn func(doc IndexedDocument) error
@@ -63,7 +63,6 @@ const persistFile = "deferred.json"
 func NewBatchIndexer(embedHour, embedMinute int) *BatchIndexer {
 	b := &BatchIndexer{
 		stopCh:      make(chan struct{}),
-		doneCh:      make(chan struct{}),
 		imageCh:     make(chan PendingImage, 1000),
 		embedHour:   embedHour,
 		embedMinute: embedMinute,
@@ -74,8 +73,10 @@ func NewBatchIndexer(embedHour, embedMinute int) *BatchIndexer {
 	b.loadDeferred()
 
 	// Start ingestion goroutine
+	b.wg.Add(1)
 	go b.ingestLoop()
 	// Start deferred processing scheduler
+	b.wg.Add(1)
 	go b.deferredProcessingLoop()
 	return b
 }
@@ -161,6 +162,7 @@ func (b *BatchIndexer) OnImageMessage(img PendingImage) {
 }
 
 func (b *BatchIndexer) ingestLoop() {
+	defer b.wg.Done()
 	for {
 		select {
 		case img := <-b.imageCh:
@@ -172,7 +174,6 @@ func (b *BatchIndexer) ingestLoop() {
 			b.saveDeferred()
 
 		case <-b.stopCh:
-			close(b.doneCh)
 			return
 		}
 	}
@@ -201,6 +202,7 @@ func (b *BatchIndexer) hasDeferredText(eventID string) bool {
 // deferredProcessingLoop waits until the configured daily time and processes
 // all deferred images (VLM description + embedding) in one batch.
 func (b *BatchIndexer) deferredProcessingLoop() {
+	defer b.wg.Done()
 	for {
 		now := time.Now()
 		next := time.Date(now.Year(), now.Month(), now.Day(),
@@ -253,9 +255,8 @@ func (b *BatchIndexer) deferredProcessingLoop() {
 
 func (b *BatchIndexer) Stop() {
 	close(b.stopCh)
-	<-b.doneCh
+	b.wg.Wait()
 }
-
 
 func (b *BatchIndexer) indexTextMessage(msg PendingMessage) {
 	// Check dedup via Bleve
