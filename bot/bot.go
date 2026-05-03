@@ -2,11 +2,8 @@ package bot
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"regexp"
 	"strings"
 	"sync"
@@ -84,11 +81,13 @@ func New(cfg *config.Config) (*Bot, error) {
 	batchIndexer.IsIndexedFn = func(eventID string) (bool, error) {
 		return bleveClient.IsEventIndexed(eventID)
 	}
-	batchIndexer.ProcessDeferredFn = func(images []indexer.PendingImage) error {
+	batchIndexer.ProcessDeferredFn = func(images []indexer.PendingImage) ([]indexer.PendingImage, error) {
+		var failed []indexer.PendingImage
 		for _, img := range images {
 			result, err := imageProcessor.ProcessImage(img.RawURL, img.RoomID, img.UserID, img.EventID, img.Timestamp, img.RawURL, img.FileName, img.MimeType)
 			if err != nil {
 				log.Printf("Failed to process deferred image %s: %v", img.EventID, err)
+				failed = append(failed, img)
 				continue
 			}
 
@@ -108,16 +107,19 @@ func New(cfg *config.Config) (*Bot, error) {
 
 			if err := bleveClient.IndexDocumentStruct(doc); err != nil {
 				log.Printf("Failed to index deferred image %s: %v", img.EventID, err)
+				failed = append(failed, img)
 				continue
 			}
 		}
-		return nil
+		return failed, nil
 	}
-	batchIndexer.ProcessDeferredTextFn = func(texts []indexer.PendingMessage) error {
+	batchIndexer.ProcessDeferredTextFn = func(texts []indexer.PendingMessage) ([]indexer.PendingMessage, error) {
+		var failed []indexer.PendingMessage
 		for _, msg := range texts {
 			vector, err := embedClient.CreateEmbedding(msg.Text)
 			if err != nil {
 				log.Printf("Failed to embed deferred text %s: %v", msg.EventID, err)
+				failed = append(failed, msg)
 				continue
 			}
 
@@ -134,10 +136,11 @@ func New(cfg *config.Config) (*Bot, error) {
 
 			if err := bleveClient.IndexDocumentStruct(doc); err != nil {
 				log.Printf("Failed to index deferred text %s: %v", msg.EventID, err)
+				failed = append(failed, msg)
 				continue
 			}
 		}
-		return nil
+		return failed, nil
 	}
 
 	return &Bot{
@@ -231,7 +234,7 @@ func (b *Bot) isDirectMessage(ev *event.Event) bool {
 	
 	// Also check if the room has isDirect flag set (Matrix spec)
 	// This helps for newly created DMs where m.direct might not be synced yet
-	if len(resp.Joined) <= 3 {
+	if len(resp.Joined) < 3 {
 		return true
 	}
 	return false
@@ -288,9 +291,9 @@ func (b *Bot) resolveRoomFromText(text string) (string, string) {
 
 	// Use the first match
 	match := matches[0]
-	roomIDOrAlias := match[0] // Full match like "#s:example.org" or "!event:server"
+	roomIDOrAlias := match[0] // Full match like "#s:example.org" or "!roomid:example.com"
 
-	// Determine if it's an alias (starts with #) or event ID (starts with !)
+	// Determine if it's an alias (starts with #) or room ID (starts with !)
 	if strings.HasPrefix(roomIDOrAlias, "#") {
 		// It's a room alias — resolve it to a room ID
 		alias := id.RoomAlias("#" + match[1] + ":" + match[2])
@@ -304,13 +307,8 @@ func (b *Bot) resolveRoomFromText(text string) (string, string) {
 		cleaned = strings.TrimSpace(cleaned)
 		return roomID.String(), cleaned
 	} else if strings.HasPrefix(roomIDOrAlias, "!") {
-		// It's an event ID — resolve it to a room ID via the event
-		eventID := id.EventID("!" + match[1] + ":" + match[2])
-		roomID, err := b.resolveEventToRoomID(eventID)
-		if err != nil {
-			log.Printf("Failed to resolve event %s: %v", eventID, err)
-			return "", text
-		}
+		// It's a room ID — use it directly (e.g., !roomid:example.com)
+		roomID := id.RoomID("!" + match[1] + ":" + match[2])
 		cleaned := strings.Replace(text, roomIDOrAlias, "", 1)
 		cleaned = strings.TrimSpace(cleaned)
 		return roomID.String(), cleaned
@@ -371,59 +369,6 @@ func (b *Bot) resolveAliasToRoomID(alias id.RoomAlias) (id.RoomID, error) {
 	return id.RoomID(resp.RoomID), nil
 }
 
-// resolveEventToRoomID resolves an event ID to a room ID by fetching the event.
-// Since we don't know the room ID, we need to resolve it via the homeserver.
-func (b *Bot) resolveEventToRoomID(eventID id.EventID) (id.RoomID, error) {
-	// Extract server name from event ID
-	parts := strings.Split(eventID.String(), ":")
-	if len(parts) != 2 {
-		return "", fmt.Errorf("invalid event ID: %s", eventID)
-	}
-
-	// Use the server's client API to get the event
-	// We need to construct a temporary client for the remote server
-	serverName := parts[1]
-	clientURL := fmt.Sprintf("https://%s/_matrix/client/v3/events/%s", serverName, eventID)
-	
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, clientURL, nil)
-	if err != nil {
-		return "", fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("User-Agent", "guiltyspark-bot")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("http request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("get event returned status %d", resp.StatusCode)
-	}
-
-	// Parse the response
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("read body: %w", err)
-	}
-	
-	var matrixEvent struct {
-		RoomID string `json:"room_id"`
-	}
-	if err := json.Unmarshal(bodyBytes, &matrixEvent); err != nil {
-		return "", fmt.Errorf("decode response: %w", err)
-	}
-
-	// Extract room_id from the event
-	if matrixEvent.RoomID != "" {
-		return id.RoomID(matrixEvent.RoomID), nil
-	}
-
-	return "", fmt.Errorf("room_id not found in event")
-}
 
 func (b *Bot) handleEvent(ev *event.Event) {
 	// Skip messages from the bot itself
