@@ -93,11 +93,14 @@ func ParseCommandArgs(args string) (*CommandArgs, error) {
 	parts := strings.Split(args, " ")
 
 	for i := 0; i < len(parts); i++ {
-		part := parts[i]
+		part := strings.TrimSpace(parts[i])
+		if part == "" {
+			continue
+		}
 		switch part {
 		case "--user":
 			if i+1 < len(parts) {
-				ca.UserFilter = parts[i+1]
+				ca.UserFilter = strings.TrimSpace(parts[i+1])
 				i++
 			}
 		default:
@@ -108,6 +111,8 @@ func ParseCommandArgs(args string) (*CommandArgs, error) {
 			}
 		}
 	}
+
+	ca.Query = strings.TrimSpace(ca.Query)
 
 	if ca.Query == "" {
 		return nil, fmt.Errorf("no query provided")
