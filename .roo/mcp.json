@@ -1,0 +1,12 @@
+{
+	"mcpServers": {
+		"gopls": {
+			"url": "http://localhost:8092",
+			"alwaysAllow": [
+				"go_diagnostics",
+				"go_search",
+				"go_symbol_references"
+			]
+		}
+	}
+}
