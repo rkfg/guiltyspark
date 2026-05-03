@@ -89,16 +89,12 @@ type CommandArgs struct {
 
 func ParseCommandArgs(args string) (*CommandArgs, error) {
 	ca := &CommandArgs{}
+
 	parts := strings.Split(args, " ")
 
 	for i := 0; i < len(parts); i++ {
 		part := parts[i]
 		switch part {
-		case "--room":
-			if i+1 < len(parts) {
-				ca.RoomFilter = parts[i+1]
-				i++
-			}
 		case "--user":
 			if i+1 < len(parts) {
 				ca.UserFilter = parts[i+1]
@@ -120,18 +116,23 @@ func ParseCommandArgs(args string) (*CommandArgs, error) {
 	return ca, nil
 }
 
-func (h *CommandHandler) HandleSearch(args string, roomID string) (string, string, error) {
+func (h *CommandHandler) HandleSearch(args string, roomID string, userFilter string) (string, string, error) {
 	ca, err := ParseCommandArgs(args)
 	if err != nil {
-		return "Usage: !search <query> [--room <room_id>] [--user <user_id>]", "", nil
+		return "Usage: !search <query> #room:server.org", "", nil
 	}
 
-	// Use the current room as the default filter if not explicitly overridden
-	if ca.RoomFilter == "" {
-		ca.RoomFilter = roomID
+	// Room filter is REQUIRED for search
+	if roomID == "" {
+		return "Error: You must specify a room to search. Use a room alias like #room:server.org", "", nil
+	}
+	
+	// Merge user filter from HTML with --user arg
+	if userFilter != "" && ca.UserFilter == "" {
+		ca.UserFilter = userFilter
 	}
 
-	result, err := h.searchEngine.ExactSearch(ca.Query, ca.RoomFilter, ca.UserFilter)
+	result, err := h.searchEngine.ExactSearch(ca.Query, roomID, ca.UserFilter)
 	if err != nil {
 		return fmt.Sprintf("Search error: %v", err), "", err
 	}
@@ -140,18 +141,23 @@ func (h *CommandHandler) HandleSearch(args string, roomID string) (string, strin
 	return textResult, htmlResult, nil
 }
 
-func (h *CommandHandler) HandleSemanticSearch(args string, roomID string) (string, string, error) {
+func (h *CommandHandler) HandleSemanticSearch(args string, roomID string, userFilter string) (string, string, error) {
 	ca, err := ParseCommandArgs(args)
 	if err != nil {
-		return "Usage: !semantic <query> [--room <room_id>] [--user <user_id>]", "", nil
+		return "Usage: !semantic <query> #room:server.org", "", nil
 	}
 
-	// Use the current room as the default filter if not explicitly overridden
-	if ca.RoomFilter == "" {
-		ca.RoomFilter = roomID
+	// Room filter is REQUIRED for semantic search
+	if roomID == "" {
+		return "Error: You must specify a room to search. Use a room alias like #room:server.org", "", nil
+	}
+	
+	// Merge user filter from HTML with --user arg
+	if userFilter != "" && ca.UserFilter == "" {
+		ca.UserFilter = userFilter
 	}
 
-	result, err := h.searchEngine.SemanticSearch(ca.Query, ca.RoomFilter, ca.UserFilter)
+	result, err := h.searchEngine.SemanticSearch(ca.Query, roomID, ca.UserFilter)
 	if err != nil {
 		return fmt.Sprintf("Semantic search error: %v", err), "", err
 	}

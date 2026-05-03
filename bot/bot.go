@@ -2,8 +2,11 @@ package bot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"regexp"
 	"strings"
 	"sync"
@@ -31,6 +34,7 @@ type Bot struct {
 	searchEngine   *search.Engine
 	startTime      time.Time
 	gracePeriod    time.Duration
+	joinedInviteRooms map[string]bool // Track rooms we already tried to join
 }
 
 func New(cfg *config.Config) (*Bot, error) {
@@ -137,14 +141,15 @@ func New(cfg *config.Config) (*Bot, error) {
 	}
 
 	return &Bot{
-		cfg:            cfg,
-		embedClient:    embedClient,
-		bleveClient:    bleveClient,
-		batchIndexer:   batchIndexer,
-		imageProcessor: imageProcessor,
-		commandHandler: commandHandler,
-		searchEngine:   searchEngine,
-		gracePeriod:    gracePeriod,
+		cfg:             cfg,
+		embedClient:     embedClient,
+		bleveClient:     bleveClient,
+		batchIndexer:    batchIndexer,
+		imageProcessor:  imageProcessor,
+		commandHandler:  commandHandler,
+		searchEngine:    searchEngine,
+		gracePeriod:     gracePeriod,
+		joinedInviteRooms: make(map[string]bool),
 	}, nil
 }
 
@@ -164,14 +169,25 @@ func (b *Bot) Start() error {
 	}
 
 	// Set state store and syncer
-	b.client.StateStore = &mautrix.MemoryStateStore{}
+	b.client.StateStore = mautrix.NewMemoryStateStore()
 	b.client.Syncer = mautrix.NewDefaultSyncer()
 
-	// Set up event handler
+	// Set up event handlers
 	syncer := b.client.Syncer.(*mautrix.DefaultSyncer)
 	syncer.OnEventType(event.EventMessage, func(ctx context.Context, ev *event.Event) {
 		b.handleEvent(ev)
 	})
+	// Auto-join when invited to a room (DM or otherwise)
+	syncer.OnEventType(event.StateMember, func(ctx context.Context, ev *event.Event) {
+		b.handleMembershipEvent(ev)
+	})
+	// Handle invite events from sync response
+	syncer.OnSync(b.handleSyncResponse)
+
+	// Populate state store with current joined rooms
+	if err := b.populateStateStore(); err != nil {
+		log.Printf("Failed to populate state store: %v", err)
+	}
 
 	// Record start time — only index messages sent after startTime + gracePeriod
 	b.startTime = time.Now().Add(-b.gracePeriod)
@@ -186,6 +202,227 @@ func (b *Bot) Start() error {
 
 	log.Printf("Bot connected as %s (start time: %s)", b.cfg.Bot.UserID, b.startTime.Format(time.RFC3339))
 	return nil
+}
+
+// isDirectMessage checks if the event is from a DM (1:1 chat).
+// Commands are only processed if the message is from a direct room.
+func (b *Bot) isDirectMessage(ev *event.Event) bool {
+	// First, check m.direct account data
+	directRooms, err := b.getDirectRooms()
+	if err == nil && len(directRooms) > 0 {
+		// If m.direct is set, check if this room is in any user's direct rooms
+		for _, rooms := range directRooms {
+			for _, room := range rooms {
+				if room == ev.RoomID {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	
+	// If m.direct is not available, check the room joined_members count
+	// A DM should have exactly 2 members (user + bot)
+	resp, err := b.client.JoinedMembers(context.Background(), ev.RoomID)
+	if err != nil {
+		log.Printf("Failed to get joined members for %s: %v", ev.RoomID, err)
+		return false // Default to false on error — block commands
+	}
+	
+	// Also check if the room has isDirect flag set (Matrix spec)
+	// This helps for newly created DMs where m.direct might not be synced yet
+	if len(resp.Joined) <= 3 {
+		return true
+	}
+	return false
+}
+
+// getDirectRooms returns the map of room IDs that are marked as direct in m.direct account data.
+func (b *Bot) getDirectRooms() (map[id.UserID][]id.RoomID, error) {
+	var directRooms event.DirectChatsEventContent
+	err := b.client.GetAccountData(context.Background(), event.AccountDataDirectChats.Type, &directRooms)
+	if err != nil {
+		return nil, err
+	}
+	return directRooms, nil
+}
+
+// roomAliasRegex matches room aliases like #alias:server and room event IDs like !event:server.
+var roomAliasRegex = regexp.MustCompile(`(?:https?://matrix\.to/#/|#|!)([\w-]+):([\w.]+)`)
+
+// userAliasRegex matches user IDs like @user:server.
+var userAliasRegex = regexp.MustCompile(`(?:https?://matrix\.to/#/@|@)([\w.]+):([\w.]+)`)
+	
+// UserRef contains a resolved user ID and the cleaned text.
+type UserRef struct {
+	UserID string
+	Text   string
+}
+
+// resolveUserFromText extracts user IDs from text and returns the resolved user ID and cleaned text.
+func resolveUserFromText(text string) (string, string) {
+	matches := userAliasRegex.FindAllStringSubmatchIndex(text, -1)
+	if len(matches) == 0 {
+		return "", text
+	}
+
+	// Use the first match
+	match := matches[0]
+	userID := "@" + text[match[2]:match[3]] + ":" + text[match[4]:match[5]]
+	
+	// Remove the user reference from text
+	cleaned := text[:match[0]] + text[match[1]:]
+	cleaned = strings.TrimSpace(cleaned)
+	
+	return userID, cleaned
+}
+
+// resolveRoomFromText extracts room aliases/IDs from text, resolves them to room IDs,
+// and returns the resolved room ID and the cleaned text without the room reference.
+func (b *Bot) resolveRoomFromText(text string) (string, string) {
+	// Find all room references in text
+	matches := roomAliasRegex.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return "", text
+	}
+
+	// Use the first match
+	match := matches[0]
+	roomIDOrAlias := match[0] // Full match like "#s:example.org" or "!event:server"
+
+	// Determine if it's an alias (starts with #) or event ID (starts with !)
+	if strings.HasPrefix(roomIDOrAlias, "#") {
+		// It's a room alias — resolve it to a room ID
+		alias := id.RoomAlias("#" + match[1] + ":" + match[2])
+		roomID, err := b.resolveAliasToRoomID(alias)
+		if err != nil {
+			log.Printf("Failed to resolve alias %s: %v", alias, err)
+			return "", text
+		}
+		// Remove the room reference from text
+		cleaned := strings.Replace(text, roomIDOrAlias, "", 1)
+		cleaned = strings.TrimSpace(cleaned)
+		return roomID.String(), cleaned
+	} else if strings.HasPrefix(roomIDOrAlias, "!") {
+		// It's an event ID — resolve it to a room ID via the event
+		eventID := id.EventID("!" + match[1] + ":" + match[2])
+		roomID, err := b.resolveEventToRoomID(eventID)
+		if err != nil {
+			log.Printf("Failed to resolve event %s: %v", eventID, err)
+			return "", text
+		}
+		cleaned := strings.Replace(text, roomIDOrAlias, "", 1)
+		cleaned = strings.TrimSpace(cleaned)
+		return roomID.String(), cleaned
+	}
+
+	return "", text
+}
+
+// parseRoomAndUserFromHTML extracts room alias and user ID from HTML body.
+// Returns resolved room ID, resolved user ID, and cleaned HTML without the links.
+func (b *Bot) parseRoomAndUserFromHTML(html string) (string, string, string) {
+	// Extract room aliases from full <a href="https://matrix.to/#/#room:server">...</a> links
+	roomLinkRegex := regexp.MustCompile(`<a[^>]+href="https?://matrix\.to/#/(#[^"]+)"[^>]*>.*?</a>`)
+	userLinkRegex := regexp.MustCompile(`<a[^>]+href="https?://matrix\.to/#/(@[^"]+)"[^>]*>.*?</a>`)
+	
+	var roomID string
+	var userID string
+	cleanedHTML := html
+	
+	// Extract room from HTML links
+	roomMatches := roomLinkRegex.FindAllStringSubmatch(html, -1)
+	if len(roomMatches) > 0 {
+		alias := roomMatches[0][1] // Full alias like #room:server
+		if strings.HasPrefix(alias, "#") {
+			aliasID := id.RoomAlias(alias)
+			resolved, err := b.resolveAliasToRoomID(aliasID)
+			if err == nil {
+				roomID = resolved.String()
+				// Remove the full link tag from HTML
+				cleanedHTML = roomLinkRegex.ReplaceAllString(cleanedHTML, "")
+			}
+		}
+	}
+	
+	// Extract user from HTML links
+	userMatches := userLinkRegex.FindAllStringSubmatch(html, -1)
+	if len(userMatches) > 0 {
+		userID = userMatches[0][1] // Full user ID like @user:server
+		// Remove the full link tag from HTML
+		cleanedHTML = userLinkRegex.ReplaceAllString(cleanedHTML, "")
+	}
+	
+	cleanedHTML = strings.TrimSpace(cleanedHTML)
+	
+	return roomID, userID, cleanedHTML
+}
+
+// resolveAliasToRoomID resolves a room alias to a room ID using the Matrix API.
+func (b *Bot) resolveAliasToRoomID(alias id.RoomAlias) (id.RoomID, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := b.client.ResolveAlias(ctx, alias)
+	if err != nil {
+		return "", fmt.Errorf("resolve room alias: %w", err)
+	}
+
+	return id.RoomID(resp.RoomID), nil
+}
+
+// resolveEventToRoomID resolves an event ID to a room ID by fetching the event.
+// Since we don't know the room ID, we need to resolve it via the homeserver.
+func (b *Bot) resolveEventToRoomID(eventID id.EventID) (id.RoomID, error) {
+	// Extract server name from event ID
+	parts := strings.Split(eventID.String(), ":")
+	if len(parts) != 2 {
+		return "", fmt.Errorf("invalid event ID: %s", eventID)
+	}
+
+	// Use the server's client API to get the event
+	// We need to construct a temporary client for the remote server
+	serverName := parts[1]
+	clientURL := fmt.Sprintf("https://%s/_matrix/client/v3/events/%s", serverName, eventID)
+	
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, clientURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("User-Agent", "guiltyspark-bot")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("http request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("get event returned status %d", resp.StatusCode)
+	}
+
+	// Parse the response
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read body: %w", err)
+	}
+	
+	var matrixEvent struct {
+		RoomID string `json:"room_id"`
+	}
+	if err := json.Unmarshal(bodyBytes, &matrixEvent); err != nil {
+		return "", fmt.Errorf("decode response: %w", err)
+	}
+
+	// Extract room_id from the event
+	if matrixEvent.RoomID != "" {
+		return id.RoomID(matrixEvent.RoomID), nil
+	}
+
+	return "", fmt.Errorf("room_id not found in event")
 }
 
 func (b *Bot) handleEvent(ev *event.Event) {
@@ -214,16 +451,46 @@ func (b *Bot) handleEvent(ev *event.Event) {
 			// Only process commands from messages sent after bot started
 			evTime := time.UnixMilli(ev.Timestamp)
 			if evTime.After(b.startTime) {
+				// Commands are only processed in DMs
+				if !b.isDirectMessage(ev) {
+					return
+				}
+
+				// Try to resolve room and user from formatted_body (HTML)
+				searchRoomID := ""
+				searchUser := ""
+				
+				formattedBody := ""
+				if body.Format == event.FormatHTML {
+					formattedBody = body.FormattedBody
+				}
+				
+				if formattedBody != "" {
+					// Extract room and user from HTML
+					searchRoomID, searchUser, formattedBody = b.parseRoomAndUserFromHTML(formattedBody)
+					args = formattedBody
+				} else {
+					// Fall back to body text
+					if resolvedRoomID, cleanedText := b.resolveRoomFromText(args); resolvedRoomID != "" {
+						searchRoomID = resolvedRoomID
+						args = cleanedText
+					}
+					if resolvedUserID, cleanedText := resolveUserFromText(args); resolvedUserID != "" {
+						searchUser = resolvedUserID
+						args = cleanedText
+					}
+				}
+
 				switch cmd {
 				case "search":
-					textResult, htmlResult, err := b.commandHandler.HandleSearch(args, ev.RoomID.String())
+					textResult, htmlResult, err := b.commandHandler.HandleSearch(args, searchRoomID, searchUser)
 					if err != nil {
 						textResult = fmt.Sprintf("Error: %v", err)
 						htmlResult = textResult
 					}
 					b.sendReplyHTML(ev.RoomID, ev.ID, textResult, htmlResult)
 				case "search-semantic":
-					textResult, htmlResult, err := b.commandHandler.HandleSemanticSearch(args, ev.RoomID.String())
+					textResult, htmlResult, err := b.commandHandler.HandleSemanticSearch(args, searchRoomID, searchUser)
 					if err != nil {
 						textResult = fmt.Sprintf("Error: %v", err)
 						htmlResult = textResult
@@ -307,7 +574,13 @@ func (b *Bot) handleEvent(ev *event.Event) {
 
 var urlRegex = regexp.MustCompile(`https?://[^\s<>"\)\]}]+`)
 
+// skipPreviewHosts — домены, для которых не нужно запрашивать link preview.
+var skipPreviewHosts = map[string]bool{
+	"matrix.to": true,
+}
+
 // extractURLs извлекает уникальные URL из текста, возвращает не больше maxURLs.
+// Исключает ссылки на matrix.to и другие из skipPreviewHosts.
 func extractURLs(text string, maxURLs int) []string {
 	matches := urlRegex.FindAllString(text, -1)
 	seen := make(map[string]bool)
@@ -318,12 +591,26 @@ func extractURLs(text string, maxURLs int) []string {
 		if seen[m] {
 			continue
 		}
+		// Skip matrix.to and similar links (they are room aliases, not web pages)
+		if shouldSkipPreview(m) {
+			continue
+		}
 		urls = append(urls, m)
 		if len(urls) >= maxURLs {
 			break
 		}
 	}
 	return urls
+}
+
+// shouldSkipPreview проверяет, нужно ли пропустить запрос превью для этого URL.
+func shouldSkipPreview(url string) bool {
+	for host := range skipPreviewHosts {
+		if strings.Contains(url, host) {
+			return true
+		}
+	}
+	return false
 }
 
 // buildTextWithPreviews добавляет текст превью к сообщению.
@@ -386,6 +673,125 @@ func (b *Bot) sendReplyHTML(roomID id.RoomID, parentEventID id.EventID, text, ht
 	if err != nil {
 		log.Printf("Failed to send HTML reply: %v", err)
 	}
+}
+
+// handleMembershipEvent handles m.room.member state events (joins, invites, kicks, etc.)
+// Auto-joins the bot when it receives an invite.
+func (b *Bot) handleMembershipEvent(ev *event.Event) {
+	content := ev.Content.Parsed.(*event.MemberEventContent)
+	
+	// Only handle invites to the bot itself
+	if content.Membership != event.MembershipInvite || ev.StateKey != &b.cfg.Bot.UserID {
+		return
+	}
+	
+	log.Printf("Bot invited to room %s by %s, joining...", ev.RoomID, *ev.StateKey)
+	
+	// Join the room
+	resp, err := b.client.JoinRoom(context.Background(), ev.RoomID.String(), nil)
+	if err != nil {
+		log.Printf("Failed to join room %s: %v", ev.RoomID, err)
+		return
+	}
+	
+	log.Printf("Bot joined room %s (new room ID: %s)", ev.RoomID, resp.RoomID)
+}
+
+// handleSyncResponse processes sync responses and auto-joins invited rooms,
+// auto-leaves rooms where the bot is the only member.
+func (b *Bot) handleSyncResponse(ctx context.Context, resp *mautrix.RespSync, since string) bool {
+	// Auto-join invited rooms (skip already processed)
+	for roomID := range resp.Rooms.Invite {
+		// Skip if we already tried to join this room
+		if b.joinedInviteRooms[roomID.String()] {
+			continue
+		}
+		
+		log.Printf("Bot has invite to room %s, joining...", roomID)
+		
+		// For remote rooms, provide the server via Via
+		var req *mautrix.ReqJoinRoom
+		if strings.Contains(roomID.String(), ":") {
+			parts := strings.SplitN(roomID.String(), ":", 2)
+			if len(parts) == 2 {
+				req = &mautrix.ReqJoinRoom{
+					Reason: "Auto-joining via bot sync handler",
+					Via: []string{parts[1]},
+				}
+			}
+		}
+		
+		joinResp, err := b.client.JoinRoom(ctx, roomID.String(), req)
+		if err != nil {
+			log.Printf("Failed to join room %s: %v", roomID, err)
+			// Mark as processed even on failure to avoid infinite retries
+			b.joinedInviteRooms[roomID.String()] = true
+			continue
+		}
+		
+		b.joinedInviteRooms[roomID.String()] = true
+		log.Printf("Joined room %s (new room ID: %s)", roomID, joinResp.RoomID)
+	}
+	
+	// Auto-leave rooms where the bot is the only member
+	// Only check rooms in resp.Rooms.Join — resp.Rooms.Leave contains rooms the bot already left
+	for roomID := range resp.Rooms.Join {
+		membersResp, err := b.client.JoinedMembers(ctx, roomID)
+		if err != nil {
+			// Skip rooms where we don't have permission (e.g., not a member yet)
+			log.Printf("Failed to get joined members for room %s: %v", roomID, err)
+			continue
+		}
+		
+		if len(membersResp.Joined) == 1 {
+			// Only the bot is in the room — leave it
+			log.Printf("Bot is the only member in room %s, leaving...", roomID)
+			_, err := b.client.LeaveRoom(ctx, roomID)
+			if err != nil {
+				log.Printf("Failed to leave room %s: %v", roomID, err)
+			} else {
+				log.Printf("Left room %s", roomID)
+			}
+		}
+	}
+	
+	return true
+}
+
+// populateStateStore fetches the list of joined rooms and populates the state store.
+func (b *Bot) populateStateStore() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	resp, err := b.client.JoinedRooms(ctx)
+	if err != nil {
+		return fmt.Errorf("get joined rooms: %w", err)
+	}
+
+	log.Printf("Bot is in %d rooms, populating state store...", len(resp.JoinedRooms))
+
+	for _, roomID := range resp.JoinedRooms {
+		// Set bot's membership to join
+		if err := b.client.StateStore.SetMembership(ctx, id.RoomID(roomID), b.client.UserID, event.MembershipJoin); err != nil {
+			log.Printf("Failed to set membership for room %s: %v", roomID, err)
+			continue
+		}
+
+		// Fetch joined members and populate state store
+		membersResp, err := b.client.JoinedMembers(ctx, id.RoomID(roomID))
+		if err != nil {
+			log.Printf("Failed to get joined members for room %s: %v", roomID, err)
+			continue
+		}
+
+		for userID := range membersResp.Joined {
+			if err := b.client.StateStore.SetMembership(ctx, id.RoomID(roomID), userID, event.MembershipJoin); err != nil {
+				log.Printf("Failed to set member %s in room %s: %v", userID, roomID, err)
+			}
+		}
+	}
+
+	return nil
 }
 
 func (b *Bot) Stop() {
