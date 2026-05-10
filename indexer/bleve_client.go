@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/blevesearch/bleve/v2"
+	_ "github.com/blevesearch/bleve/v2/analysis/lang/ru"
 	"github.com/blevesearch/bleve/v2/index/scorch"
 	"github.com/blevesearch/bleve/v2/search/query"
 	index "github.com/blevesearch/bleve_index_api"
@@ -30,7 +31,7 @@ type BleveClient struct {
 	processedEventIDs map[string]bool
 }
 
-func NewBleveClient(indexPath string, vectorDims int) (*BleveClient, error) {
+func NewBleveClient(indexPath string, vectorDims int, analyzer string) (*BleveClient, error) {
 	// Increase persister nap time to allow segments to accumulate
 	// before persisting, reducing disk I/O during bulk indexing.
 	scorch.DefaultPersisterNapTimeMSec = 500
@@ -38,7 +39,7 @@ func NewBleveClient(indexPath string, vectorDims int) (*BleveClient, error) {
 	indexMapping := bleve.NewIndexMapping()
 
 	textMapping := bleve.NewTextFieldMapping()
-	textMapping.Analyzer = "standard"
+	textMapping.Analyzer = analyzer
 
 	keywordMapping := bleve.NewKeywordFieldMapping()
 

@@ -44,8 +44,9 @@ type LLMConfig struct {
 }
 
 type SearchConfig struct {
-	VectorDimensions int `yaml:"vector_dimensions"`
-	ResultLimit      int `yaml:"result_limit"`
+	VectorDimensions int    `yaml:"vector_dimensions"`
+	ResultLimit      int    `yaml:"result_limit"`
+	Analyzer         string `yaml:"analyzer"`
 }
 
 type LinkPreviewConfig struct {
@@ -138,6 +139,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Search.VectorDimensions == 0 {
 		c.Search.VectorDimensions = 1536
+	}
+	if c.Search.Analyzer == "" {
+		c.Search.Analyzer = "ru"
 	}
 	if c.Search.ResultLimit == 0 {
 		c.Search.ResultLimit = 5

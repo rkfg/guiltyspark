@@ -41,6 +41,12 @@ llm:
 search:
   vector_dimensions: 4096
   result_limit: 5
+  # Bleve analyzer for text/image_desc fields
+  # Built-in: keyword, simple, standard, web, custom
+  # Language-specific: ru, en, de, fr, es, it, pt, nl, no, da, sv, fi, hu, ar, tr, fa, hi, hi,
+  # cjk (Chinese/Japanese/Korean), cs, hr, pl, ro, el, ga, gl, hy, id, in, eu
+  # Note: language-specific analyzers require source code modifications
+  analyzer: "ru"
 
 image_processing:
   convert_binary: "convert"

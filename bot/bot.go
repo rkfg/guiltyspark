@@ -58,6 +58,7 @@ func New(cfg *config.Config) (*Bot, error) {
 	bleveClient, err := indexer.NewBleveClient(
 		fmt.Sprintf("%s/index.bleve", cfg.StoragePath),
 		cfg.Search.VectorDimensions,
+		cfg.Search.Analyzer,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create bleve client: %w", err)
