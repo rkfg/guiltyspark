@@ -53,7 +53,7 @@ func New(cfg *config.Config) (*Bot, error) {
 	}
 
 	// Create batch indexer
-	batchIndexer := indexer.NewBatchIndexer(cfg.Indexing.DelayedEmbedHour, cfg.Indexing.DelayedEmbedMinute)
+	batchIndexer := indexer.NewBatchIndexer(cfg.Indexing.DelayedEmbedHour, cfg.Indexing.DelayedEmbedMinute, cfg.StoragePath)
 
 	// Create image processor
 	imageProcessor := indexer.NewImageProcessor(&cfg.ImageProc, embedClient)

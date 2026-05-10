@@ -72,14 +72,14 @@ type PendingImage struct {
 
 const persistFile = "deferred.json"
 
-func NewBatchIndexer(embedHour, embedMinute int) *BatchIndexer {
+func NewBatchIndexer(embedHour, embedMinute int, persistDir string) *BatchIndexer {
 	b := &BatchIndexer{
 		msgBuffer: make(map[string]*messageBuffer),
 		stopCh:    make(chan struct{}),
 		imageCh:   make(chan PendingImage, 1000),
 		embedHour: embedHour,
 		embedMinute: embedMinute,
-		persistDir: "./bot-data",
+		persistDir:  persistDir,
 	}
 
 	b.loadDeferred()
