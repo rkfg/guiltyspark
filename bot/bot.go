@@ -308,6 +308,19 @@ func (b *Bot) Start() error {
 	// Initialize E2EE crypto helper — this sets up decryption for m.room.encrypted events
 	// and registers its own handlers for ProcessSyncResponse, HandleMemberEvent, HandleEncrypted
 	ctx := context.Background()
+
+	// Resolve device ID from access token before Init() — cryptohelper.Init() checks
+	// client.DeviceID != "" at line 201 and returns error before creating mach (line 204)
+	// if device ID is empty. Whoami() populates it from the access token.
+	if b.client.DeviceID == "" {
+		whoamiResp, err := b.client.Whoami(ctx)
+		if err != nil {
+			log.Printf("WARNING: Whoami failed: %v, continuing without device ID resolution", err)
+		} else {
+			b.client.DeviceID = whoamiResp.DeviceID
+		}
+	}
+
 	initErr := b.cryptoHelper.Init(ctx)
 
 	// When login_password is set, cryptohelper logs in via StoreCredentials
