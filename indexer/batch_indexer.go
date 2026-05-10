@@ -204,10 +204,6 @@ func (b *BatchIndexer) flushBufferLocked(buf *messageBuffer) int {
 		Text:      buf.text,
 	}
 	if b.indexTextMessage(msg) {
-		if b.SendReceiptFn != nil {
-			lastEid := buf.allEventIDs[len(buf.allEventIDs)-1]
-			b.SendReceiptFn(buf.RoomID, lastEid)
-		}
 		// Mark all event IDs from this buffer as processed
 		if b.AddEventIDFn != nil {
 			for _, eid := range buf.allEventIDs {
@@ -459,14 +455,4 @@ func (b *BatchIndexer) indexTextMessage(msg PendingMessage) bool {
 	}
 	log.Printf("INFO batch_indexer: indexed text event %s", msg.EventID)
 	return true
-}
-
-// BufferedLastEventID returns the last event ID in the buffer for a room.
-func (b *BatchIndexer) BufferedLastEventID(roomID string) string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if buf, exists := b.msgBuffer[roomID]; exists {
-		return buf.allEventIDs[len(buf.allEventIDs)-1]
-	}
-	return ""
 }

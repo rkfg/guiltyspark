@@ -708,10 +708,7 @@ func (b *Bot) handleEvent(ev *event.Event) {
 
 		b.batchIndexer.OnTextMessageWithBuffering(msg)
 		if b.batchIndexer.SendReceiptFn != nil {
-			lastEid := b.batchIndexer.BufferedLastEventID(ev.RoomID.String())
-			if lastEid != "" {
-				b.batchIndexer.SendReceiptFn(ev.RoomID.String(), lastEid)
-			}
+			b.batchIndexer.SendReceiptFn(ev.RoomID.String(), ev.ID.String())
 		}
 	} else if body.MsgType == event.MsgImage {
 		// Index as image message
