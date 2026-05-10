@@ -88,6 +88,8 @@ func NewBatchIndexer(embedHour, embedMinute int, persistDir string) *BatchIndexe
 	go b.ingestLoop()
 	b.wg.Add(1)
 	go b.deferredProcessingLoop()
+	b.wg.Add(1)
+	go b.periodicSaveLoop()
 	return b
 }
 
@@ -166,7 +168,6 @@ func (b *BatchIndexer) OnTextMessageWithBuffering(msg PendingMessage) int {
 			existing.Timestamp = msg.Timestamp
 			b.reindexBufferLocked(existing)
 			b.mu.Unlock()
-			b.saveDeferred()
 			return 0
 		}
 		count = b.flushBufferLocked(existing)
@@ -183,7 +184,6 @@ func (b *BatchIndexer) OnTextMessageWithBuffering(msg PendingMessage) int {
 	}
 
 	b.mu.Unlock()
-	b.saveDeferred()
 
 	return count
 }
@@ -244,7 +244,6 @@ func (b *BatchIndexer) ingestLoop() {
 				}
 			}
 			b.mu.Unlock()
-			b.saveDeferred()
 
 		case <-b.stopCh:
 			return
@@ -276,6 +275,20 @@ func (b *BatchIndexer) hasDeferredText(eventID string) bool {
 		}
 	}
 	return false
+}
+
+func (b *BatchIndexer) periodicSaveLoop() {
+	defer b.wg.Done()
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			b.saveDeferred()
+		case <-b.stopCh:
+			return
+		}
+	}
 }
 
 // deferredProcessingLoop waits until the configured daily time and processes
@@ -374,6 +387,7 @@ func (b *BatchIndexer) deferredProcessingLoop() {
 func (b *BatchIndexer) Stop() {
 	close(b.stopCh)
 	b.wg.Wait()
+	b.saveDeferred()
 }
 
 // FlushRoom flushes the buffer for a specific room.
@@ -386,7 +400,6 @@ func (b *BatchIndexer) FlushRoom(roomID string) int {
 		delete(b.msgBuffer, roomID)
 	}
 	b.mu.Unlock()
-	b.saveDeferred()
 	return count
 }
 
@@ -410,7 +423,6 @@ func (b *BatchIndexer) FlushBufferedMessages() int {
 			delete(b.msgBuffer, key)
 		}
 		b.mu.Unlock()
-		b.saveDeferred()
 	}
 	return flushed
 }

@@ -3,8 +3,10 @@ package indexer
 import (
 	"fmt"
 	"log"
+	"sync"
 
 	"github.com/blevesearch/bleve/v2"
+	"github.com/blevesearch/bleve/v2/index/scorch"
 	"github.com/blevesearch/bleve/v2/search/query"
 	index "github.com/blevesearch/bleve_index_api"
 )
@@ -12,9 +14,22 @@ import (
 type BleveClient struct {
 	index        bleve.Index
 	eventIDIndex bleve.Index
+	mu           sync.Mutex
+
+	// batchBuf accumulates docs for batched indexing to reduce disk I/O.
+	batchBuf    []IndexedDocument
+	batchBufLen int
+
+	// eventIDBuf accumulates event IDs for batched storage.
+	eventIDBuf    []string
+	eventIDBufLen int
 }
 
 func NewBleveClient(indexPath string, vectorDims int) (*BleveClient, error) {
+	// Increase persister nap time to allow segments to accumulate
+	// before persisting, reducing disk I/O during bulk indexing.
+	scorch.DefaultPersisterNapTimeMSec = 500
+
 	indexMapping := bleve.NewIndexMapping()
 
 	textMapping := bleve.NewTextFieldMapping()
@@ -70,6 +85,14 @@ func NewBleveClient(indexPath string, vectorDims int) (*BleveClient, error) {
 }
 
 func (b *BleveClient) Close() error {
+	b.mu.Lock()
+	if err := b.flushBatchLocked(); err != nil {
+		log.Printf("ERROR bleve: failed to flush batch on close: %v", err)
+	}
+	if err := b.flushEventIDBatchLocked(); err != nil {
+		log.Printf("ERROR bleve: failed to flush eventID batch on close: %v", err)
+	}
+	b.mu.Unlock()
 	err := b.index.Close()
 	if err2 := b.eventIDIndex.Close(); err2 != nil && err == nil {
 		err = err2
@@ -77,13 +100,40 @@ func (b *BleveClient) Close() error {
 	return err
 }
 
-// IndexDocumentStruct uses struct-based indexing which preserves []float32 type
+// IndexDocumentStruct uses struct-based indexing which preserves []float32 type.
+// Accumulates documents in a buffer and flushes in batches of 100 to reduce
+// disk I/O (segment creation + bolt sync) during bulk indexing.
 func (b *BleveClient) IndexDocumentStruct(doc IndexedDocument) error {
-	err := b.index.Index(doc.ID, doc)
-	if err != nil {
-		log.Printf("ERROR bleve: IndexDocumentStruct docID=%s ERROR=%v", doc.ID, err)
+	b.mu.Lock()
+	b.batchBufLen++
+	if b.batchBufLen > cap(b.batchBuf) {
+		newBuf := make([]IndexedDocument, len(b.batchBuf)+100)
+		copy(newBuf, b.batchBuf)
+		b.batchBuf = newBuf
 	}
-	return err
+	b.batchBuf[b.batchBufLen-1] = doc
+
+	const batchSize = 100
+	var flushErr error
+	if b.batchBufLen >= batchSize {
+		flushErr = b.flushBatchLocked()
+	}
+	b.mu.Unlock()
+	return flushErr
+}
+
+func (b *BleveClient) flushBatchLocked() error {
+	if b.batchBufLen == 0 {
+		return nil
+	}
+	batch := b.index.NewBatch()
+	for i := 0; i < b.batchBufLen; i++ {
+		if err := batch.Index(b.batchBuf[i].ID, b.batchBuf[i]); err != nil {
+			log.Printf("ERROR bleve: batch index error docID=%s ERROR=%v", b.batchBuf[i].ID, err)
+		}
+	}
+	b.batchBufLen = 0
+	return b.index.Batch(batch)
 }
 
 func (b *BleveClient) SearchExact(queryText string, roomID string) (*bleve.SearchResult, error) {
@@ -156,8 +206,38 @@ func (b *BleveClient) IsEventIndexed(eventID string) (bool, error) {
 }
 
 // AddEventID stores an event ID in the processedEvents index for deduplication.
+// Buffers event IDs and flushes in batches to reduce disk I/O.
 func (b *BleveClient) AddEventID(eventID string) error {
-	return b.eventIDIndex.Index(eventID, map[string]any{"event_id": eventID})
+	b.mu.Lock()
+	b.eventIDBufLen++
+	if b.eventIDBufLen > cap(b.eventIDBuf) {
+		newBuf := make([]string, len(b.eventIDBuf)+50)
+		copy(newBuf, b.eventIDBuf)
+		b.eventIDBuf = newBuf
+	}
+	b.eventIDBuf[b.eventIDBufLen-1] = eventID
+
+	const eventIDBatchSize = 50
+	var flushErr error
+	if b.eventIDBufLen >= eventIDBatchSize {
+		flushErr = b.flushEventIDBatchLocked()
+	}
+	b.mu.Unlock()
+	return flushErr
+}
+
+func (b *BleveClient) flushEventIDBatchLocked() error {
+	if b.eventIDBufLen == 0 {
+		return nil
+	}
+	batch := b.eventIDIndex.NewBatch()
+	for i := 0; i < b.eventIDBufLen; i++ {
+		if err := batch.Index(b.eventIDBuf[i], map[string]any{"event_id": b.eventIDBuf[i]}); err != nil {
+			log.Printf("ERROR bleve: batch eventID index error eventID=%s ERROR=%v", b.eventIDBuf[i], err)
+		}
+	}
+	b.eventIDBufLen = 0
+	return b.eventIDIndex.Batch(batch)
 }
 
 // IsEventIDExists checks if an event ID exists in the processedEvents index.
@@ -185,4 +265,16 @@ func (b *BleveClient) CountDocuments() (int, error) {
 	}
 
 	return int(result.Total), nil
+}
+
+func (b *BleveClient) NewBatch() *bleve.Batch {
+	return b.index.NewBatch()
+}
+
+func (b *BleveClient) BatchIndex(batch *bleve.Batch, doc IndexedDocument) error {
+	return batch.Index(doc.ID, doc)
+}
+
+func (b *BleveClient) ExecBatch(batch *bleve.Batch) error {
+	return b.index.Batch(batch)
 }
