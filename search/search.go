@@ -7,6 +7,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/blevesearch/bleve/v2"
 	"github.com/blevesearch/bleve/v2/search"
 	"github.com/rkfg/guiltyspark/config"
 	"github.com/rkfg/guiltyspark/indexer"
@@ -68,12 +69,21 @@ var russianStopWords = map[string]bool{
 	"an": true, "if": true, "so": true, "up": true, "out": true, "into": true, "than": true, "then": true,
 }
 
+const (
+	punctuationTrim  = ".,!?;:\"'()[]{}"
+	textTruncateLen  = 200
+	imageTruncateLen = 200
+	defaultLimit     = 5
+
+	noResultsText     = "No results found."
+	noSemanticText    = "No semantic results found."
+)
+
 func filterStopWords(query string) string {
 	words := strings.Fields(strings.ToLower(query))
 	var filtered []string
 	for _, w := range words {
-		// Clean punctuation
-		clean := strings.Trim(w, ".,!?;:\"'()[]{}")
+		clean := strings.Trim(w, punctuationTrim)
 		if clean != "" && !russianStopWords[clean] {
 			filtered = append(filtered, clean)
 		}
@@ -81,50 +91,19 @@ func filterStopWords(query string) string {
 	return strings.Join(filtered, " ")
 }
 
-func (e *Engine) Search(queryText string, roomFilter, userFilter string) (*SearchResult, error) {
-	result := &SearchResult{Query: queryText}
-
-	// Filter stop words from query
-	filteredQuery := filterStopWords(queryText)
-	if filteredQuery == "" {
-		return result, nil
+func limitResults(results []Result, limit int) []Result {
+	if limit <= 0 {
+		limit = defaultLimit
 	}
-
-	// Get embedding for semantic search
-	vector, err := e.embedClient.CreateEmbedding(filteredQuery)
-	if err != nil {
-		return nil, fmt.Errorf("create query embedding: %w", err)
+	if len(results) > limit {
+		return results[:limit]
 	}
-	result.QueryVector = vector
-	log.Printf("INFO search: query=%q filtered=%q embedding dims=%d first3=%v", queryText, filteredQuery, len(vector), vector[:min(3, len(vector))])
+	return results
+}
 
-	// Exact search
-	exactResults, err := e.bleveClient.SearchExact(filteredQuery, roomFilter)
-	if err != nil {
-		return nil, fmt.Errorf("exact search: %w", err)
-	}
-
-	for _, hit := range exactResults.Hits {
-		if len(userFilter) > 0 && hit.Fields["user_id"] != userFilter {
-			continue
-		}
-		r := convertHit(hit)
-		r.Score = hit.Score
-		result.Exact = append(result.Exact, r)
-	}
-
-	// Semantic search using Bleve native kNN with FAISS backend
-	semanticResults, err := e.bleveClient.SearchSemantic(vector, roomFilter)
-	if err != nil {
-		return nil, fmt.Errorf("semantic search: %w", err)
-	}
-
-	log.Printf("INFO search: semantic total=%d (limit=%d)", len(semanticResults.Hits), e.cfg.ResultLimit)
-	for i, hit := range semanticResults.Hits {
-		log.Printf("INFO search:   semantic hit[%d] id=%s score=%.6f", i, hit.ID, hit.Score)
-	}
-
-	for _, hit := range semanticResults.Hits {
+func filterHitsByUserAndRoom(hits []*search.DocumentMatch, roomFilter, userFilter string) []Result {
+	var results []Result
+	for _, hit := range hits {
 		if len(roomFilter) > 0 && hit.Fields["room_id"] != roomFilter {
 			continue
 		}
@@ -133,23 +112,112 @@ func (e *Engine) Search(queryText string, roomFilter, userFilter string) (*Searc
 		}
 		r := convertHit(hit)
 		r.Score = hit.Score
-		result.Semantic = append(result.Semantic, r)
+		results = append(results, r)
+	}
+	return results
+}
+
+func escapeHTML(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, "\n", "<br>")
+	return s
+}
+
+func (e *Engine) prepareQuery(queryText string) (string, []float32) {
+	filteredQuery := filterStopWords(queryText)
+	if filteredQuery == "" {
+		return "", nil
+	}
+	vector, err := e.embedClient.CreateEmbedding(filteredQuery)
+	if err != nil {
+		panic(fmt.Errorf("create query embedding: %w", err))
+	}
+	log.Printf("INFO search: query=%q filtered=%q embedding dims=%d first3=%v", queryText, filteredQuery, len(vector), vector[:min(3, len(vector))])
+	return filteredQuery, vector
+}
+
+func logSemanticHits(semanticResults *bleve.SearchResult, limit int) {
+	log.Printf("INFO search: semantic total=%d (limit=%d)", len(semanticResults.Hits), limit)
+	for i, hit := range semanticResults.Hits {
+		log.Printf("INFO search:   semantic hit[%d] id=%s score=%.6f", i, hit.ID, hit.Score)
+	}
+}
+
+func appendFormattedResults(textParts, htmlParts []string, results []Result, sectionHeaderText, sectionHeaderHTML string) ([]string, []string) {
+	if len(results) == 0 {
+		return textParts, htmlParts
+	}
+	textParts = append(textParts, "\n"+sectionHeaderText)
+	htmlParts = append(htmlParts, "<br>"+sectionHeaderHTML+"<br/>")
+	for i, r := range results {
+		t, h := formatResult(r, i+1)
+		textParts = append(textParts, t)
+		htmlParts = append(htmlParts, h)
+	}
+	return textParts, htmlParts
+}
+
+func formatResult(r Result, idx int) (string, string) {
+	var textLine strings.Builder
+	var htmlLine strings.Builder
+
+	eventLink := fmt.Sprintf("https://matrix.to/#/%s/%s", r.RoomID, r.EventID)
+	ts := formatTimestamp(r.Timestamp)
+	fmt.Fprintf(&textLine, "%d. %s", idx, ts)
+	fmt.Fprintf(&htmlLine, "%d. %s %s", idx, ts, eventLink)
+	if r.Score > 0 {
+		fmt.Fprintf(&textLine, " (score: %.4f)", r.Score)
+		fmt.Fprintf(&htmlLine, " <i>score: %.4f</i>", r.Score)
 	}
 
+	if r.Text != "" {
+		truncated := truncate(r.Text, textTruncateLen)
+		fmt.Fprintf(&textLine, "\n%s\n", truncated)
+		fmt.Fprintf(&htmlLine, "<br>%s<br>", escapeHTML(truncated))
+	}
+	if r.ImageDesc != "" {
+		truncated := truncate(r.ImageDesc, imageTruncateLen)
+		fmt.Fprintf(&textLine, "\n\U0001f50d %s", truncated)
+		fmt.Fprintf(&htmlLine, "<br>\U0001f50d %s", escapeHTML(truncated))
+	}
+
+	fmt.Fprint(&textLine, "\n")
+	fmt.Fprint(&htmlLine, "<br>")
+
+	return textLine.String(), htmlLine.String()
+}
+
+func (e *Engine) Search(queryText string, roomFilter, userFilter string) (*SearchResult, error) {
+	filteredQuery, vector := e.prepareQuery(queryText)
+	if filteredQuery == "" {
+		return &SearchResult{Query: queryText}, nil
+	}
+
+	result := &SearchResult{Query: queryText}
+	result.QueryVector = vector
+
+	// Exact search
+	exactResults, err := e.bleveClient.SearchExact(filteredQuery, roomFilter)
+	if err != nil {
+		return nil, fmt.Errorf("exact search: %w", err)
+	}
+
+	result.Exact = filterHitsByUserAndRoom(exactResults.Hits, "", userFilter)
+	result.Exact = limitResults(result.Exact, e.cfg.ResultLimit)
+
+	// Semantic search using Bleve native kNN with FAISS backend
+	semanticResults, err := e.bleveClient.SearchSemantic(vector, roomFilter)
+	if err != nil {
+		return nil, fmt.Errorf("semantic search: %w", err)
+	}
+
+	logSemanticHits(semanticResults, e.cfg.ResultLimit)
+
+	result.Semantic = filterHitsByUserAndRoom(semanticResults.Hits, roomFilter, userFilter)
+	result.Semantic = limitResults(result.Semantic, e.cfg.ResultLimit)
 	log.Printf("INFO search: semantic results=%d (limit=%d)", len(result.Semantic), e.cfg.ResultLimit)
-
-	// Limit results
-	limit := e.cfg.ResultLimit
-	if limit <= 0 {
-		limit = 5
-	}
-
-	if len(result.Exact) > limit {
-		result.Exact = result.Exact[:limit]
-	}
-	if len(result.Semantic) > limit {
-		result.Semantic = result.Semantic[:limit]
-	}
 
 	// Deduplicate semantic results against exact results
 	seen := make(map[string]bool)
@@ -170,21 +238,13 @@ func (e *Engine) Search(queryText string, roomFilter, userFilter string) (*Searc
 
 // SemanticSearch performs only semantic (vector) search without exact text search.
 func (e *Engine) SemanticSearch(queryText string, roomFilter, userFilter string) (*SearchResult, error) {
-	result := &SearchResult{Query: queryText}
-
-	// Filter stop words from query
-	filteredQuery := filterStopWords(queryText)
+	filteredQuery, vector := e.prepareQuery(queryText)
 	if filteredQuery == "" {
-		return result, nil
+		return &SearchResult{Query: queryText}, nil
 	}
 
-	// Get embedding for semantic search
-	vector, err := e.embedClient.CreateEmbedding(filteredQuery)
-	if err != nil {
-		return nil, fmt.Errorf("create query embedding: %w", err)
-	}
+	result := &SearchResult{Query: queryText}
 	result.QueryVector = vector
-	log.Printf("INFO search: semantic query=%q filtered=%q embedding dims=%d first3=%v", queryText, filteredQuery, len(vector), vector[:min(3, len(vector))])
 
 	// Semantic search using Bleve native kNN with FAISS backend
 	semanticResults, err := e.bleveClient.SearchSemantic(vector, roomFilter)
@@ -192,44 +252,22 @@ func (e *Engine) SemanticSearch(queryText string, roomFilter, userFilter string)
 		return nil, fmt.Errorf("semantic search: %w", err)
 	}
 
-	log.Printf("INFO search: semantic total=%d (limit=%d)", len(semanticResults.Hits), e.cfg.ResultLimit)
-	for i, hit := range semanticResults.Hits {
-		log.Printf("INFO search:   semantic hit[%d] id=%s score=%.6f", i, hit.ID, hit.Score)
-	}
+	logSemanticHits(semanticResults, e.cfg.ResultLimit)
 
-	for _, hit := range semanticResults.Hits {
-		if len(roomFilter) > 0 && hit.Fields["room_id"] != roomFilter {
-			continue
-		}
-		if len(userFilter) > 0 && hit.Fields["user_id"] != userFilter {
-			continue
-		}
-		r := convertHit(hit)
-		r.Score = hit.Score
-		result.Semantic = append(result.Semantic, r)
-	}
-
-	// Limit results
-	limit := e.cfg.ResultLimit
-	if limit <= 0 {
-		limit = 5
-	}
-	if len(result.Semantic) > limit {
-		result.Semantic = result.Semantic[:limit]
-	}
+	result.Semantic = filterHitsByUserAndRoom(semanticResults.Hits, roomFilter, userFilter)
+	result.Semantic = limitResults(result.Semantic, e.cfg.ResultLimit)
 
 	return result, nil
 }
 
 // ExactSearch performs only exact (text) search without semantic search.
 func (e *Engine) ExactSearch(queryText string, roomFilter, userFilter string) (*SearchResult, error) {
-	result := &SearchResult{Query: queryText}
-
-	// Filter stop words from query
 	filteredQuery := filterStopWords(queryText)
 	if filteredQuery == "" {
-		return result, nil
+		return &SearchResult{Query: queryText}, nil
 	}
+
+	result := &SearchResult{Query: queryText}
 
 	// Exact search
 	exactResults, err := e.bleveClient.SearchExact(filteredQuery, roomFilter)
@@ -237,23 +275,8 @@ func (e *Engine) ExactSearch(queryText string, roomFilter, userFilter string) (*
 		return nil, fmt.Errorf("exact search: %w", err)
 	}
 
-	for _, hit := range exactResults.Hits {
-		if len(userFilter) > 0 && hit.Fields["user_id"] != userFilter {
-			continue
-		}
-		r := convertHit(hit)
-		r.Score = hit.Score
-		result.Exact = append(result.Exact, r)
-	}
-
-	// Limit results
-	limit := e.cfg.ResultLimit
-	if limit <= 0 {
-		limit = 5
-	}
-	if len(result.Exact) > limit {
-		result.Exact = result.Exact[:limit]
-	}
+	result.Exact = filterHitsByUserAndRoom(exactResults.Hits, "", userFilter)
+	result.Exact = limitResults(result.Exact, e.cfg.ResultLimit)
 
 	return result, nil
 }
@@ -265,29 +288,12 @@ func (e *Engine) FormatResults(result *SearchResult) (text, html string) {
 	textParts = append(textParts, fmt.Sprintf("*Search results for:* %q", result.Query))
 	htmlParts = append(htmlParts, fmt.Sprintf("<b>Search results for:</b> %q", result.Query))
 
-	if len(result.Exact) > 0 {
-		textParts = append(textParts, "\n*Exact matches:*")
-		htmlParts = append(htmlParts, "<br><b>Exact matches:</b><br/>")
-		for i, r := range result.Exact {
-			t, h := e.formatResult(r, i+1)
-			textParts = append(textParts, t)
-			htmlParts = append(htmlParts, h)
-		}
-	}
-
-	if len(result.Semantic) > 0 {
-		textParts = append(textParts, "\n*Similar (semantic):*")
-		htmlParts = append(htmlParts, "<br><b>Similar (semantic):</b><br/>")
-		for i, r := range result.Semantic {
-			t, h := e.formatResult(r, i+1)
-			textParts = append(textParts, t)
-			htmlParts = append(htmlParts, h)
-		}
-	}
+	textParts, htmlParts = appendFormattedResults(textParts, htmlParts, result.Exact, "*Exact matches:*", "<b>Exact matches:</b>")
+	textParts, htmlParts = appendFormattedResults(textParts, htmlParts, result.Semantic, "*Similar (semantic):*", "<b>Similar (semantic):</b>")
 
 	if len(result.Exact) == 0 && len(result.Semantic) == 0 {
-		textParts = append(textParts, "No results found.")
-		htmlParts = append(htmlParts, "No results found.")
+		textParts = append(textParts, noResultsText)
+		htmlParts = append(htmlParts, noResultsText)
 	}
 
 	return strings.Join(textParts, "\n"), strings.Join(htmlParts, "\n")
@@ -300,63 +306,14 @@ func (e *Engine) FormatSemanticResults(result *SearchResult) (text, html string)
 	textParts = append(textParts, fmt.Sprintf("*Semantic search results for:* %q", result.Query))
 	htmlParts = append(htmlParts, fmt.Sprintf("<b>Semantic search results for:</b> %q", result.Query))
 
-	if len(result.Semantic) > 0 {
-		textParts = append(textParts, "\n*Similar (semantic):*")
-		htmlParts = append(htmlParts, "<br><b>Similar (semantic):</b><br/>")
-		for i, r := range result.Semantic {
-			t, h := e.formatResult(r, i+1)
-			textParts = append(textParts, t)
-			htmlParts = append(htmlParts, h)
-		}
-	}
+	textParts, htmlParts = appendFormattedResults(textParts, htmlParts, result.Semantic, "*Similar (semantic):*", "<b>Similar (semantic):</b>")
 
 	if len(result.Semantic) == 0 {
-		textParts = append(textParts, "No semantic results found.")
-		htmlParts = append(htmlParts, "No semantic results found.")
+		textParts = append(textParts, noSemanticText)
+		htmlParts = append(htmlParts, noSemanticText)
 	}
 
 	return strings.Join(textParts, "\n"), strings.Join(htmlParts, "\n")
-}
-
-func (e *Engine) formatResult(r Result, idx int) (string, string) {
-	var textLine strings.Builder
-	var htmlLine strings.Builder
-
-	// Build Matrix-to link for event (Element auto-converts plain URL to pill)
-	// Format: https://matrix.to/#/{roomId}/{eventId}
-	eventLink := fmt.Sprintf("https://matrix.to/#/%s/%s", r.RoomID, r.EventID)
-	fmt.Fprintf(&textLine, "%d. %s", idx, formatTimestamp(r.Timestamp))
-	fmt.Fprintf(&htmlLine, "%d. %s", idx, formatTimestamp(r.Timestamp))
-	fmt.Fprintf(&htmlLine, " %s", eventLink)
-	if r.Score > 0 {
-		fmt.Fprintf(&textLine, " (score: %.4f)", r.Score)
-		fmt.Fprintf(&htmlLine, " <i>score: %.4f</i>", r.Score)
-	}
-
-	// Escape HTML and convert newlines to <br>
-	escapeHTML := func(s string) string {
-		s = strings.ReplaceAll(s, "&", "&amp;")
-		s = strings.ReplaceAll(s, "<", "&lt;")
-		s = strings.ReplaceAll(s, ">", "&gt;")
-		s = strings.ReplaceAll(s, "\n", "<br>")
-		return s
-	}
-
-	if r.Text != "" {
-		truncated := truncate(r.Text, 200)
-		fmt.Fprintf(&textLine, "\n%s\n", truncated)
-		fmt.Fprintf(&htmlLine, "<br>%s<br>", escapeHTML(truncated))
-	}
-	if r.ImageDesc != "" {
-		truncated := truncate(r.ImageDesc, 200)
-		fmt.Fprintf(&textLine, "\n\U0001f50d %s", truncated)
-		fmt.Fprintf(&htmlLine, "<br>\U0001f50d %s", escapeHTML(truncated))
-	}
-
-	fmt.Fprint(&textLine, "\n")
-	fmt.Fprint(&htmlLine, "<br>")
-
-	return textLine.String(), htmlLine.String()
 }
 
 func formatTimestamp(ts int64) string {
