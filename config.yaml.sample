@@ -7,6 +7,16 @@ bot:
   access_token: "YOUR_ACCESS_TOKEN"
   storage_path: "./bot-data"
 
+# E2EE support — required to receive messages in encrypted (Megolm) rooms.
+# The bot creates a NEW device via password login and establishes a proper Olm account.
+# Without login_password, E2EE may not work (see code for fallback).
+e2ee:
+  db_path: "./bot-data/e2ee.db"
+  pickle_key: "change-me-to-a-random-string"
+  # password for the bot account — used to create a new device with proper E2EE
+  # leave empty to use existing access_token (E2EE may not work in encrypted rooms)
+  login_password: ""
+
 indexing:
   # Delayed LLM processing for images — daily time (hour 0-23, minute 0-59)
   # Default: 05:00. Text indexing happens immediately, LLM (VLM + embedding)

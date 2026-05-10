@@ -3,10 +3,17 @@
 ## Build
 
 ```bash
-go build -tags vectors ./cmd/bot/
+go build -tags vectors -o bot-bin ./cmd/bot/
 ```
 
 **Важно:** флаг `-tags vectors` обязателен. Без него не компилируется `AddKNN` и векторные поля в `bleve_client.go` — это тег из `github.com/blevesearch/bleve/v2` для поддержки векторного поиска через FAISS.
+
+**Проверка сборки** (не удаляет бинарник после сборки):
+```bash
+go build -tags vectors -o bot-bin ./cmd/bot/ && go vet -tags vectors ./...
+```
+
+Бинарник сохраняется как `bot-bin` в корне проекта. Не удаляется автоматически.
 
 ## Runtime dependencies
 

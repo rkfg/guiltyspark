@@ -1,17 +1,24 @@
 package bot
 
 import (
+	"slices"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+
+	"github.com/rs/zerolog"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	"go.mau.fi/util/dbutil"
+	_ "go.mau.fi/util/dbutil/litestream"
 	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/crypto/cryptohelper"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -35,6 +42,7 @@ type Bot struct {
 	gracePeriod       time.Duration
 	joinedInviteRooms map[string]bool
 	inviteMu          sync.Mutex
+	cryptoHelper      *cryptohelper.CryptoHelper
 }
 
 func New(cfg *config.Config) (*Bot, error) {
@@ -178,8 +186,83 @@ func New(cfg *config.Config) (*Bot, error) {
 		return failed, nil
 	}
 
+	// Create E2EE crypto infrastructure
+	// Use INFO level to suppress crypto module debug noise but keep important startup messages
+	clientLog := zerolog.New(os.Stdout).With().Timestamp().Logger().Level(zerolog.InfoLevel)
+	userID := id.UserID(cfg.Bot.UserID)
+
+	var mclient *mautrix.Client
+	var cryptoHelper *cryptohelper.CryptoHelper
+
+	if cfg.E2EE.LoginPassword != "" {
+		// New device approach: login with password to create a device with proper Olm account.
+		// Clear the Olm account only if there's none — otherwise reuse the existing account
+		// across restarts to avoid creating new Olm keys and accumulating sessions.
+		if _, err := os.Stat(cfg.E2EE.DBPath); err == nil {
+			db, err := dbutil.NewWithDialect(
+				fmt.Sprintf("file:%s?_txlock=immediate", cfg.E2EE.DBPath),
+				"sqlite3-fk-wal",
+			)
+			if err != nil {
+				return nil, fmt.Errorf("open e2ee database: %w", err)
+			}
+
+			var accountCount int
+			err = db.QueryRow(context.Background(), "SELECT COUNT(*) FROM crypto_account").Scan(&accountCount)
+			if err != nil {
+				db.Close()
+				return nil, fmt.Errorf("check Olm account: %w", err)
+			}
+
+			if accountCount == 0 {
+				log.Printf("No existing Olm account, creating fresh E2EE device")
+				_, err = db.Exec(context.Background(), "DELETE FROM crypto_account")
+				if err != nil {
+					db.Close()
+					return nil, fmt.Errorf("clear Olm account: %w", err)
+				}
+			} else {
+				log.Printf("Existing Olm account found (%d), reusing", accountCount)
+			}
+			db.Close()
+		}
+
+		mclient, err = mautrix.NewClient(cfg.Bot.Homeserver, userID, "")
+		if err != nil {
+			return nil, fmt.Errorf("create mautrix client: %w", err)
+		}
+		mclient.Log = clientLog
+
+		cryptoHelper, err = cryptohelper.NewCryptoHelper(mclient, []byte(cfg.E2EE.PickleKey), cfg.E2EE.DBPath)
+		if err != nil {
+			return nil, fmt.Errorf("create crypto helper: %w", err)
+		}
+		cryptoHelper.DBAccountID = "guiltyspark-bot"
+		cryptoHelper.LoginAs = &mautrix.ReqLogin{
+			Type:                   mautrix.AuthTypePassword,
+			Identifier:             mautrix.UserIdentifier{Type: mautrix.IdentifierTypeUser, User: cfg.Bot.UserID},
+			Password:               cfg.E2EE.LoginPassword,
+			InitialDeviceDisplayName: "guiltyspark-search-bot",
+		}
+	} else {
+		// Fallback: use existing access token (E2EE may not work properly)
+		log.Println("E2EE: using existing access token (E2EE may not work in encrypted rooms)")
+		mclient, err = mautrix.NewClient(cfg.Bot.Homeserver, userID, cfg.Bot.AccessToken)
+		if err != nil {
+			return nil, fmt.Errorf("create mautrix client: %w", err)
+		}
+		mclient.Log = clientLog
+
+		cryptoHelper, err = cryptohelper.NewCryptoHelper(mclient, []byte(cfg.E2EE.PickleKey), cfg.E2EE.DBPath)
+		if err != nil {
+			return nil, fmt.Errorf("create crypto helper: %w", err)
+		}
+		cryptoHelper.DBAccountID = "guiltyspark-bot"
+	}
+
 	return &Bot{
 		cfg:               cfg,
+		client:            mclient,
 		embedClient:       embedClient,
 		bleveClient:       bleveClient,
 		batchIndexer:      batchIndexer,
@@ -188,6 +271,7 @@ func New(cfg *config.Config) (*Bot, error) {
 		searchEngine:      searchEngine,
 		gracePeriod:       gracePeriod,
 		joinedInviteRooms: make(map[string]bool),
+		cryptoHelper:      cryptoHelper,
 	}, nil
 }
 
@@ -198,16 +282,7 @@ func (b *Bot) Start() error {
 		return fmt.Errorf("invalid homeserver URL: %s", b.cfg.Bot.Homeserver)
 	}
 
-	// Create mautrix client
-	userID := id.UserID(b.cfg.Bot.UserID)
-	var err error
-	b.client, err = mautrix.NewClient(b.cfg.Bot.Homeserver, userID, b.cfg.Bot.AccessToken)
-	if err != nil {
-		return fmt.Errorf("create mautrix client: %w", err)
-	}
-
-	// Set state store and syncer
-	b.client.StateStore = mautrix.NewMemoryStateStore()
+	// Set syncer (client and state store already created in New())
 	b.client.Syncer = mautrix.NewDefaultSyncer()
 
 	// Set up event handlers
@@ -221,6 +296,56 @@ func (b *Bot) Start() error {
 	})
 	// Handle invite events from sync response
 	syncer.OnSync(b.handleSyncResponse)
+
+	// Initialize E2EE crypto helper — this sets up decryption for m.room.encrypted events
+	// and registers its own handlers for ProcessSyncResponse, HandleMemberEvent, HandleEncrypted
+	ctx := context.Background()
+	initErr := b.cryptoHelper.Init(ctx)
+
+	// When login_password is set, cryptohelper logs in via StoreCredentials
+	// which sets client.AccessToken = resp.AccessToken on the client.
+	// But we also check LoginAs.Token in case the flow used token login.
+	if b.cfg.E2EE.LoginPassword != "" && b.client.AccessToken == "" {
+		log.Println("WARNING: client.AccessToken is empty after Init, trying fallback...")
+		if b.cryptoHelper.LoginAs != nil && b.cryptoHelper.LoginAs.Token != "" {
+			b.client.AccessToken = b.cryptoHelper.LoginAs.Token
+		}
+	}
+
+	// Fallback: use existing access token approach with ShareKeys workaround
+	// (only when login_password is not set)
+	if initErr != nil && b.cfg.E2EE.LoginPassword == "" {
+		log.Println("Fallback E2EE: re-registering sync listeners and sharing keys...")
+		syncer := b.client.Syncer.(mautrix.ExtensibleSyncer)
+		syncer.OnSync(b.cryptoHelper.Machine().ProcessSyncResponse)
+		syncer.OnEventType(event.StateMember, b.cryptoHelper.Machine().HandleMemberEvent)
+		if _, ok := b.client.Syncer.(mautrix.DispatchableSyncer); ok {
+			syncer.OnEventType(event.EventEncrypted, b.cryptoHelper.HandleEncrypted)
+		}
+
+		if strings.Contains(initErr.Error(), "not marked as shared") {
+			log.Println("Existing non-E2EE device found on server, sharing fresh Olm keys...")
+			if err := b.cryptoHelper.Machine().ShareKeys(ctx, -1); err != nil {
+				if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "M_UNKNOWN") {
+					log.Println("One-time keys already on server, continuing without ShareKeys")
+				} else {
+					return fmt.Errorf("share keys: %w", err)
+				}
+			} else {
+				log.Println("E2EE keys shared, continuing with fresh account")
+			}
+			initErr = nil
+		}
+	}
+	if initErr != nil {
+		return fmt.Errorf("init e2ee crypto: %w", initErr)
+	}
+	log.Printf("E2EE crypto initialized (device: %s, token: %s)", b.client.DeviceID, func() string {
+		if b.client.AccessToken != "" {
+			return b.client.AccessToken[:10] + "..."
+		}
+		return "<empty>"
+	}())
 
 	// Populate state store with current joined rooms
 	if err := b.populateStateStore(); err != nil {
@@ -263,16 +388,15 @@ func (b *Bot) isDirectMessage(ev *event.Event) bool {
 	if err == nil && len(directRooms) > 0 {
 		// If m.direct is set, check if this room is in any user's direct rooms
 		for _, rooms := range directRooms {
-			for _, room := range rooms {
-				if room == ev.RoomID {
+			if slices.Contains(rooms, ev.RoomID) {
 					return true
 				}
-			}
 		}
-		return false
+		// Room not in m.direct — fall back to member count check
+		// (e.g. newly created DMs, or unencrypted DMs not synced to m.direct)
 	}
 
-	// If m.direct is not available, check the room joined_members count
+	// Check the room joined_members count
 	// A DM should have exactly 2 members (user + bot)
 	resp, err := b.client.JoinedMembers(context.Background(), ev.RoomID)
 	if err != nil {
@@ -807,6 +931,9 @@ func (b *Bot) Stop() {
 	b.batchIndexer.Stop()
 	b.bleveClient.Close()
 	b.client.StopSync()
+	if b.cryptoHelper != nil {
+		b.cryptoHelper.Close()
+	}
 }
 
 // fetchPreviews extracts URLs from text, skips preview hosts, and fetches previews

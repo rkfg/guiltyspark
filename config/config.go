@@ -17,6 +17,7 @@ type Config struct {
 	Retry        RetryConfig        `yaml:"retry"`
 	LinkPreview  LinkPreviewConfig `yaml:"link_preview"`
 	HistoryScan  HistoryScanConfig `yaml:"history_scan"`
+	E2EE         E2EEConfig        `yaml:"e2ee"`
 	StoragePath  string             `yaml:"storage_path"`
 	Rooms        map[string]*RoomConfig `yaml:"rooms"`
 }
@@ -72,6 +73,12 @@ type RetryConfig struct {
 
 type HistoryScanConfig struct {
 	StalePagesThreshold int `yaml:"stale_pages_threshold"`
+}
+
+type E2EEConfig struct {
+	DBPath       string `yaml:"db_path"`
+	PickleKey    string `yaml:"pickle_key"`
+	LoginPassword string `yaml:"login_password"`
 }
 
 type RoomConfig struct {
@@ -179,6 +186,12 @@ func (c *Config) Validate() error {
 	}
 	if c.HistoryScan.StalePagesThreshold == 0 {
 		c.HistoryScan.StalePagesThreshold = 3
+	}
+	if c.E2EE.DBPath == "" {
+		c.E2EE.DBPath = "./bot-data/e2ee.db"
+	}
+	if c.E2EE.PickleKey == "" {
+		c.E2EE.PickleKey = "guiltyspark-e2ee-pickle-key-change-me"
 	}
 	if c.Rooms != nil {
 		for roomID, roomCfg := range c.Rooms {
