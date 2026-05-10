@@ -260,6 +260,14 @@ func New(cfg *config.Config) (*Bot, error) {
 		cryptoHelper.DBAccountID = "guiltyspark-bot"
 	}
 
+	batchIndexer.SendReceiptFn = func(roomID, eventID string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := mclient.SendReceipt(ctx, id.RoomID(roomID), id.EventID(eventID), event.ReceiptTypeRead, nil); err != nil {
+			log.Printf("Failed to send read receipt for %s in %s: %v", eventID, roomID, err)
+		}
+	}
+
 	return &Bot{
 		cfg:               cfg,
 		client:            mclient,
@@ -685,6 +693,12 @@ func (b *Bot) handleEvent(ev *event.Event) {
 		}
 
 		b.batchIndexer.OnTextMessageWithBuffering(msg)
+		if b.batchIndexer.SendReceiptFn != nil {
+			lastEid := b.batchIndexer.BufferedLastEventID(ev.RoomID.String())
+			if lastEid != "" {
+				b.batchIndexer.SendReceiptFn(ev.RoomID.String(), lastEid)
+			}
+		}
 	} else if body.MsgType == event.MsgImage {
 		// Index as image message
 		img := indexer.PendingImage{
@@ -698,6 +712,9 @@ func (b *Bot) handleEvent(ev *event.Event) {
 		}
 
 		b.batchIndexer.OnImageMessage(img)
+		if b.batchIndexer.SendReceiptFn != nil {
+			b.batchIndexer.SendReceiptFn(ev.RoomID.String(), ev.ID.String())
+		}
 	}
 }
 
