@@ -5,7 +5,7 @@
             "type": "go",
             "label": "go: build cmd/bot",
             "command": "build",
-            "args": ["-tags", "vectors", "-o", "guiltyspark", "./cmd/bot"],
+            "args": ["-tags", "vectors", "-ldflags=-s -w", "-o", "guiltyspark", "./cmd/bot"],
             "problemMatcher": ["$go"],
             "group": {
                 "kind": "build",

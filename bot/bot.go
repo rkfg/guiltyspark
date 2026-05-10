@@ -2,8 +2,10 @@ package bot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"regexp"
 	"strings"
 	"sync"
@@ -31,7 +33,8 @@ type Bot struct {
 	searchEngine      *search.Engine
 	startTime         time.Time
 	gracePeriod       time.Duration
-	joinedInviteRooms map[string]bool // Track rooms we already tried to join
+	joinedInviteRooms map[string]bool
+	inviteMu          sync.Mutex
 }
 
 func New(cfg *config.Config) (*Bot, error) {
@@ -210,7 +213,7 @@ func (b *Bot) Start() error {
 	// Set up event handlers
 	syncer := b.client.Syncer.(*mautrix.DefaultSyncer)
 	syncer.OnEventType(event.EventMessage, func(ctx context.Context, ev *event.Event) {
-		b.handleEvent(ev)
+		go b.handleEvent(ev)
 	})
 	// Auto-join when invited to a room (DM or otherwise)
 	syncer.OnEventType(event.StateMember, func(ctx context.Context, ev *event.Event) {
@@ -665,14 +668,16 @@ func (b *Bot) handleMembershipEvent(ev *event.Event) {
 
 	log.Printf("Bot invited to room %s by %s, joining...", ev.RoomID, *ev.StateKey)
 
-	// Join the room
-	resp, err := b.client.JoinRoom(context.Background(), ev.RoomID.String(), nil)
-	if err != nil {
-		log.Printf("Failed to join room %s: %v", ev.RoomID, err)
-		return
-	}
+	// Join the room in a goroutine to avoid blocking the sync loop
+	go func() {
+		resp, err := b.client.JoinRoom(context.Background(), ev.RoomID.String(), nil)
+		if err != nil {
+			log.Printf("Failed to join room %s: %v", ev.RoomID, err)
+			return
+		}
 
-	log.Printf("Bot joined room %s (new room ID: %s)", ev.RoomID, resp.RoomID)
+		log.Printf("Bot joined room %s (new room ID: %s)", ev.RoomID, resp.RoomID)
+	}()
 }
 
 // handleSyncResponse processes sync responses and auto-joins invited rooms,
@@ -680,10 +685,13 @@ func (b *Bot) handleMembershipEvent(ev *event.Event) {
 func (b *Bot) handleSyncResponse(ctx context.Context, resp *mautrix.RespSync, since string) bool {
 	// Auto-join invited rooms (skip already processed)
 	for roomID := range resp.Rooms.Invite {
-		// Skip if we already tried to join this room
+		b.inviteMu.Lock()
 		if b.joinedInviteRooms[roomID.String()] {
+			b.inviteMu.Unlock()
 			continue
 		}
+		b.joinedInviteRooms[roomID.String()] = true
+		b.inviteMu.Unlock()
 
 		log.Printf("Bot has invite to room %s, joining...", roomID)
 
@@ -699,16 +707,15 @@ func (b *Bot) handleSyncResponse(ctx context.Context, resp *mautrix.RespSync, si
 			}
 		}
 
-		joinResp, err := b.client.JoinRoom(ctx, roomID.String(), req)
-		if err != nil {
-			log.Printf("Failed to join room %s: %v", roomID, err)
-			// Mark as processed even on failure to avoid infinite retries
-			b.joinedInviteRooms[roomID.String()] = true
-			continue
-		}
-
-		b.joinedInviteRooms[roomID.String()] = true
-		log.Printf("Joined room %s (new room ID: %s)", roomID, joinResp.RoomID)
+		// Join in a goroutine to avoid blocking the sync loop
+		go func(rID id.RoomID, rReq *mautrix.ReqJoinRoom) {
+			joinResp, err := b.client.JoinRoom(context.Background(), rID.String(), rReq)
+			if err != nil {
+				log.Printf("Failed to join room %s: %v", rID, err)
+				return
+			}
+			log.Printf("Joined room %s (new room ID: %s)", rID, joinResp.RoomID)
+		}(roomID, req)
 	}
 
 	// Auto-leave rooms where the bot is the only member
@@ -797,7 +804,7 @@ func (b *Bot) fetchPreviews(text string) []*event.LinkPreview {
 		wg.Add(1)
 		go func(rawURL string) {
 			defer wg.Done()
-			preview, err := b.client.GetURLPreview(ctx, rawURL)
+			preview, err := b.fetchPreviewViaAPI(ctx, rawURL)
 			if err != nil {
 				log.Printf("Failed to get preview for %s: %v", rawURL, err)
 				return
@@ -810,6 +817,80 @@ func (b *Bot) fetchPreviews(text string) []*event.LinkPreview {
 
 	wg.Wait()
 	return previews
+}
+
+// fetchPreviewViaAPI fetches a URL preview by making a direct HTTP request
+// to the homeserver's /preview_url endpoint with proper double URL encoding.
+//
+// We can't use mautrix's GetURLPreview because BuildURLWithQuery → url.Values.Encode()
+// → url.QueryEscape in Go 1.19+ does not percent-encode non-ASCII bytes — they pass
+// through as raw UTF-8. The Matrix server (Synapse) requires ASCII-only query params
+// and rejects non-ASCII URLs with 400 or 502 errors. Additionally, BuildURLWithQuery
+// doesn't allow custom query parameter encoding, so any manual double-encoding of the
+// URL value would get re-encoded (e.g. ":" → "%3A", "/" → "%2F"), producing a triple-
+// encoded URL that also fails. Direct HTTP request bypasses these mautrix limitations.
+func (b *Bot) fetchPreviewViaAPI(ctx context.Context, targetURL string) (*event.LinkPreview, error) {
+	// Double-encode the URL: first encode non-ASCII bytes to %XX, then encode % as %25
+	// to match what Element sends to the homeserver.
+	encodedURL := doubleEncodeURL(targetURL)
+
+	// Build the homeserver API URL directly with proper query parameter encoding
+	homeserverURL := b.client.HomeserverURL.String()
+	fullURL := homeserverURL + "/_matrix/client/v1/media/preview_url?url=" + encodedURL
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+b.client.AccessToken)
+
+	resp, err := b.client.Client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var apiErr struct {
+			ErrCode string `json:"errcode"`
+			Error   string `json:"error"`
+		}
+		if decodeErr := json.NewDecoder(resp.Body).Decode(&apiErr); decodeErr == nil && apiErr.ErrCode != "" {
+			return nil, fmt.Errorf("M_%s (HTTP %d): %s", apiErr.ErrCode, resp.StatusCode, apiErr.Error)
+		}
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	var output event.LinkPreview
+	if err := json.NewDecoder(resp.Body).Decode(&output); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return &output, nil
+}
+
+// doubleEncodeURL produces the same encoding that Element uses for the Matrix
+// homeserver /preview_url endpoint: non-ASCII bytes are double-percent-encoded.
+func doubleEncodeURL(raw string) string {
+	// Step 1: encode non-ASCII bytes to %XX
+	step1 := ""
+	for i := 0; i < len(raw); i++ {
+		if raw[i] < 128 {
+			step1 += string(raw[i])
+		} else {
+			step1 += fmt.Sprintf("%%%02X", raw[i])
+		}
+	}
+
+	// Step 2: encode % → %25 (preserving already-encoded %XX sequences)
+	result := ""
+	for i := 0; i < len(step1); i++ {
+		if step1[i] == '%' {
+			result += "%25"
+		} else {
+			result += string(step1[i])
+		}
+	}
+	return result
 }
 
 // ScanRoomHistory scans a room's message history backwards from the present
@@ -879,10 +960,6 @@ func (b *Bot) ScanRoomHistory(roomID string, cutoffUnix int64) {
 			switch body.MsgType {
 			case event.MsgText:
 				text := body.Body
-				if b.cfg.LinkPreview.Enabled {
-					previews := b.fetchPreviews(text)
-					text = buildTextWithPreviews(text, previews)
-				}
 				msg := indexer.PendingMessage{
 					EventID:   ev.ID.String(),
 					RoomID:    ev.RoomID.String(),
