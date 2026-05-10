@@ -10,9 +10,9 @@ import (
 )
 
 var commandAliases = map[string][]string{
-	"search":          {"s", "find", "искать", "поиск", "п"},
-	"search-semantic": {"semantic", "семантик", "сем", "с", "similarity", "similar", "related"},
-	"help":            {"?", "помощь", "h"},
+	"search":          {"s", "ы", "find", "искать", "поиск", "п", "g"},
+	"search-semantic": {"semantic", "семантик", "сем", "с", "c", "similarity", "sim", "similar", "related"},
+	"help":            {"?", "помощь", "h", "р"},
 	"stats":           {"status", "стат", "info"},
 }
 

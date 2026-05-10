@@ -10,7 +10,8 @@ import (
 )
 
 type BleveClient struct {
-	index bleve.Index
+	index        bleve.Index
+	eventIDIndex bleve.Index
 }
 
 func NewBleveClient(indexPath string, vectorDims int) (*BleveClient, error) {
@@ -50,11 +51,30 @@ func NewBleveClient(indexPath string, vectorDims int) (*BleveClient, error) {
 		log.Printf("INFO bleve: Opened existing index at %s", indexPath)
 	}
 
-	return &BleveClient{index: index}, nil
+	// Create processedEvents index — minimal mapping, only event_id field
+	eventIDMapping := bleve.NewIndexMapping()
+	eventIDMapping.DefaultMapping = bleve.NewDocumentMapping()
+	eventIDMapping.DefaultMapping.AddFieldMappingsAt("event_id", bleve.NewKeywordFieldMapping())
+	eventIDIndex, err := bleve.Open(indexPath + ".eventid")
+	if err != nil {
+		eventIDIndex, err = bleve.New(indexPath+".eventid", eventIDMapping)
+		if err != nil {
+			return nil, fmt.Errorf("create eventID index: %w", err)
+		}
+		log.Printf("INFO bleve: Created new processedEvents index at %s.eventid", indexPath)
+	} else {
+		log.Printf("INFO bleve: Opened existing processedEvents index at %s.eventid", indexPath)
+	}
+
+	return &BleveClient{index: index, eventIDIndex: eventIDIndex}, nil
 }
 
 func (b *BleveClient) Close() error {
-	return b.index.Close()
+	err := b.index.Close()
+	if err2 := b.eventIDIndex.Close(); err2 != nil && err == nil {
+		err = err2
+	}
+	return err
 }
 
 // IndexDocumentStruct uses struct-based indexing which preserves []float32 type
@@ -100,7 +120,7 @@ func (b *BleveClient) SearchExact(queryText string, roomID string) (*bleve.Searc
 
 func (b *BleveClient) SearchSemantic(queryVector []float32, roomID string) (*bleve.SearchResult, error) {
 	searchReq := bleve.NewSearchRequest(bleve.NewMatchAllQuery())
-	searchReq.Size = 50
+	searchReq.Size = 5
 	searchReq.Fields = []string{"text", "image_desc", "user_id", "room_id", "timestamp", "event_id", "raw_url", "file_name", "mime_type"}
 
 	// Log query vector for debugging
@@ -108,7 +128,7 @@ func (b *BleveClient) SearchSemantic(queryVector []float32, roomID string) (*ble
 
 	// Use plain kNN without pre-filter to preserve original search behavior.
 	// Room filtering is applied post-search (in search.Engine.Search).
-	searchReq.AddKNN("vector", queryVector, 50, 1.0)
+	searchReq.AddKNN("vector", queryVector, 5, 1.0)
 
 	result, err := b.index.Search(searchReq)
 	if err != nil {
@@ -124,20 +144,32 @@ func (b *BleveClient) SearchSemantic(queryVector []float32, roomID string) (*ble
 }
 
 func (b *BleveClient) IsEventIndexed(eventID string) (bool, error) {
-	// Use MatchQuery on event_id field
-	// MatchQuery tokenizes input with the same analyzer used during indexing,
-	// so if the event_id was indexed, it will be found
-	q := bleve.NewMatchQuery(eventID)
+	q := bleve.NewTermQuery(eventID)
 	q.SetField("event_id")
-
 	searchReq := bleve.NewSearchRequest(q)
 	searchReq.Size = 1
-
 	result, err := b.index.Search(searchReq)
 	if err != nil {
 		return false, err
 	}
+	return result.Total > 0, nil
+}
 
+// AddEventID stores an event ID in the processedEvents index for deduplication.
+func (b *BleveClient) AddEventID(eventID string) error {
+	return b.eventIDIndex.Index(eventID, map[string]any{"event_id": eventID})
+}
+
+// IsEventIDExists checks if an event ID exists in the processedEvents index.
+func (b *BleveClient) IsEventIDExists(eventID string) (bool, error) {
+	q := bleve.NewTermQuery(eventID)
+	q.SetField("event_id")
+	searchReq := bleve.NewSearchRequest(q)
+	searchReq.Size = 1
+	result, err := b.eventIDIndex.Search(searchReq)
+	if err != nil {
+		return false, err
+	}
 	return result.Total > 0, nil
 }
 

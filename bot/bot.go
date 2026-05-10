@@ -21,16 +21,16 @@ import (
 )
 
 type Bot struct {
-	cfg            *config.Config
-	client         *mautrix.Client
-	embedClient    *embedding.Client
-	bleveClient    *indexer.BleveClient
-	batchIndexer   *indexer.BatchIndexer
-	imageProcessor *indexer.ImageProcessor
-	commandHandler *CommandHandler
-	searchEngine   *search.Engine
-	startTime      time.Time
-	gracePeriod    time.Duration
+	cfg               *config.Config
+	client            *mautrix.Client
+	embedClient       *embedding.Client
+	bleveClient       *indexer.BleveClient
+	batchIndexer      *indexer.BatchIndexer
+	imageProcessor    *indexer.ImageProcessor
+	commandHandler    *CommandHandler
+	searchEngine      *search.Engine
+	startTime         time.Time
+	gracePeriod       time.Duration
 	joinedInviteRooms map[string]bool // Track rooms we already tried to join
 }
 
@@ -72,21 +72,47 @@ func New(cfg *config.Config) (*Bot, error) {
 	batchIndexer.IndexTextFn = func(doc indexer.IndexedDocument) error {
 		// Index in Bleve for text search
 		// Use struct-based indexing to preserve []float32 type for vector field
-		// map[string]interface{} would convert []float32 to []interface{}{float64, ...}
+		// map[string]any would convert []float32 to []any{float64, ...}
 		if err := bleveClient.IndexDocumentStruct(doc); err != nil {
 			return err
+		}
+		// Mark event ID as processed immediately — prevents re-indexing on restart
+		// even if the event was appended to another document (reindex via buffering)
+		if err := bleveClient.AddEventID(doc.EventID); err != nil {
+			log.Printf("Failed to mark event ID %s as processed: %v", doc.EventID, err)
 		}
 		return nil
 	}
 	batchIndexer.IsIndexedFn = func(eventID string) (bool, error) {
 		return bleveClient.IsEventIndexed(eventID)
 	}
-	batchIndexer.ProcessDeferredFn = func(images []indexer.PendingImage) ([]indexer.PendingImage, error) {
+	batchIndexer.AddEventIDFn = func(eventID string) error {
+		return bleveClient.AddEventID(eventID)
+	}
+	batchIndexer.ProcessImageDescFn = func(images []indexer.PendingImage) ([]indexer.PendingImage, error) {
+		var failed []indexer.PendingImage
+		for i, img := range images {
+			desc, err := imageProcessor.DescribeImageOnly(img.RawURL, img.Timestamp)
+			if err != nil {
+				log.Printf("Failed to describe deferred image %s: %v", img.EventID, err)
+				failed = append(failed, img)
+				continue
+			}
+			images[i].Description = desc
+		}
+		return images, nil
+	}
+	batchIndexer.ProcessImageEmbedFn = func(images []indexer.PendingImage) ([]indexer.PendingImage, error) {
 		var failed []indexer.PendingImage
 		for _, img := range images {
-			result, err := imageProcessor.ProcessImage(img.RawURL, img.RoomID, img.UserID, img.EventID, img.Timestamp, img.RawURL, img.FileName, img.MimeType)
+			if img.Description == "" {
+				failed = append(failed, img)
+				continue
+			}
+
+			vector, err := embedClient.CreateEmbedding(img.Description)
 			if err != nil {
-				log.Printf("Failed to process deferred image %s: %v", img.EventID, err)
+				log.Printf("Failed to embed deferred image %s: %v", img.EventID, err)
 				failed = append(failed, img)
 				continue
 			}
@@ -98,8 +124,8 @@ func New(cfg *config.Config) (*Bot, error) {
 				UserID:    img.UserID,
 				Timestamp: img.Timestamp,
 				EventType: "m.room.message",
-				ImageDesc: result.Description,
-				Vector:    result.Vector,
+				ImageDesc: img.Description,
+				Vector:    vector,
 				RawURL:    img.RawURL,
 				FileName:  img.FileName,
 				MimeType:  img.MimeType,
@@ -109,6 +135,9 @@ func New(cfg *config.Config) (*Bot, error) {
 				log.Printf("Failed to index deferred image %s: %v", img.EventID, err)
 				failed = append(failed, img)
 				continue
+			}
+			if err := bleveClient.AddEventID(img.EventID); err != nil {
+				log.Printf("Failed to mark event ID %s as processed: %v", img.EventID, err)
 			}
 		}
 		return failed, nil
@@ -139,19 +168,22 @@ func New(cfg *config.Config) (*Bot, error) {
 				failed = append(failed, msg)
 				continue
 			}
+			if err := bleveClient.AddEventID(msg.EventID); err != nil {
+				log.Printf("Failed to mark event ID %s as processed: %v", msg.EventID, err)
+			}
 		}
 		return failed, nil
 	}
 
 	return &Bot{
-		cfg:             cfg,
-		embedClient:     embedClient,
-		bleveClient:     bleveClient,
-		batchIndexer:    batchIndexer,
-		imageProcessor:  imageProcessor,
-		commandHandler:  commandHandler,
-		searchEngine:    searchEngine,
-		gracePeriod:     gracePeriod,
+		cfg:               cfg,
+		embedClient:       embedClient,
+		bleveClient:       bleveClient,
+		batchIndexer:      batchIndexer,
+		imageProcessor:    imageProcessor,
+		commandHandler:    commandHandler,
+		searchEngine:      searchEngine,
+		gracePeriod:       gracePeriod,
 		joinedInviteRooms: make(map[string]bool),
 	}, nil
 }
@@ -203,6 +235,19 @@ func (b *Bot) Start() error {
 		}
 	}()
 
+	// Start history scan for configured rooms
+	for key, roomCfg := range b.cfg.Rooms {
+		if roomCfg.HistoryScanCutoff == "" {
+			continue
+		}
+		resolvedID, err := b.resolveRoomKeyToID(key)
+		if err != nil {
+			log.Printf("WARN bot: failed to resolve room key %q: %v", key, err)
+			continue
+		}
+		go b.ScanRoomHistory(string(resolvedID), roomCfg.ScanCutoffUnix)
+	}
+
 	log.Printf("Bot connected as %s (start time: %s)", b.cfg.Bot.UserID, b.startTime.Format(time.RFC3339))
 	return nil
 }
@@ -223,7 +268,7 @@ func (b *Bot) isDirectMessage(ev *event.Event) bool {
 		}
 		return false
 	}
-	
+
 	// If m.direct is not available, check the room joined_members count
 	// A DM should have exactly 2 members (user + bot)
 	resp, err := b.client.JoinedMembers(context.Background(), ev.RoomID)
@@ -231,7 +276,7 @@ func (b *Bot) isDirectMessage(ev *event.Event) bool {
 		log.Printf("Failed to get joined members for %s: %v", ev.RoomID, err)
 		return false // Default to false on error — block commands
 	}
-	
+
 	// Also check if the room has isDirect flag set (Matrix spec)
 	// This helps for newly created DMs where m.direct might not be synced yet
 	if len(resp.Joined) < 3 {
@@ -255,7 +300,7 @@ var roomAliasRegex = regexp.MustCompile(`(?:https?://matrix\.to/#/|#|!)([\w-]+):
 
 // userAliasRegex matches user IDs like @user:server.
 var userAliasRegex = regexp.MustCompile(`(?:https?://matrix\.to/#/@|@)([\w.]+):([\w.]+)`)
-	
+
 // UserRef contains a resolved user ID and the cleaned text.
 type UserRef struct {
 	UserID string
@@ -272,11 +317,11 @@ func resolveUserFromText(text string) (string, string) {
 	// Use the first match
 	match := matches[0]
 	userID := "@" + text[match[2]:match[3]] + ":" + text[match[4]:match[5]]
-	
+
 	// Remove the user reference from text
 	cleaned := text[:match[0]] + text[match[1]:]
 	cleaned = strings.TrimSpace(cleaned)
-	
+
 	return userID, cleaned
 }
 
@@ -323,11 +368,11 @@ func (b *Bot) parseRoomAndUserFromHTML(html string) (string, string, string) {
 	// Extract room aliases from full <a href="https://matrix.to/#/#room:server">...</a> links
 	roomLinkRegex := regexp.MustCompile(`<a[^>]+href="https?://matrix\.to/#/(#[^"]+)"[^>]*>.*?</a>`)
 	userLinkRegex := regexp.MustCompile(`<a[^>]+href="https?://matrix\.to/#/(@[^"]+)"[^>]*>.*?</a>`)
-	
+
 	var roomID string
 	var userID string
 	cleanedHTML := html
-	
+
 	// Extract room from HTML links
 	roomMatches := roomLinkRegex.FindAllStringSubmatch(html, -1)
 	if len(roomMatches) > 0 {
@@ -342,7 +387,7 @@ func (b *Bot) parseRoomAndUserFromHTML(html string) (string, string, string) {
 			}
 		}
 	}
-	
+
 	// Extract user from HTML links
 	userMatches := userLinkRegex.FindAllStringSubmatch(html, -1)
 	if len(userMatches) > 0 {
@@ -350,9 +395,9 @@ func (b *Bot) parseRoomAndUserFromHTML(html string) (string, string, string) {
 		// Remove the full link tag from HTML
 		cleanedHTML = userLinkRegex.ReplaceAllString(cleanedHTML, "")
 	}
-	
+
 	cleanedHTML = strings.TrimSpace(cleanedHTML)
-	
+
 	return roomID, userID, cleanedHTML
 }
 
@@ -369,6 +414,19 @@ func (b *Bot) resolveAliasToRoomID(alias id.RoomAlias) (id.RoomID, error) {
 	return id.RoomID(resp.RoomID), nil
 }
 
+// resolveRoomKeyToID resolves a config key that may be a room alias or room ID to an actual room ID.
+func (b *Bot) resolveRoomKeyToID(key string) (id.RoomID, error) {
+	if strings.HasPrefix(key, "#") {
+		alias := id.RoomAlias(key)
+		roomID, err := b.resolveAliasToRoomID(alias)
+		if err != nil {
+			return "", fmt.Errorf("resolve alias %q: %w", key, err)
+		}
+		return roomID, nil
+	}
+	// Already a room ID or something else — treat as room ID directly
+	return id.RoomID(key), nil
+}
 
 func (b *Bot) handleEvent(ev *event.Event) {
 	// Skip messages from the bot itself
@@ -404,12 +462,12 @@ func (b *Bot) handleEvent(ev *event.Event) {
 				// Try to resolve room and user from formatted_body (HTML)
 				searchRoomID := ""
 				searchUser := ""
-				
+
 				formattedBody := ""
 				if body.Format == event.FormatHTML {
 					formattedBody = body.FormattedBody
 				}
-				
+
 				if formattedBody != "" {
 					// Extract room and user from HTML
 					searchRoomID, searchUser, formattedBody = b.parseRoomAndUserFromHTML(formattedBody)
@@ -462,33 +520,8 @@ func (b *Bot) handleEvent(ev *event.Event) {
 
 		// Add link previews if enabled
 		if b.cfg.LinkPreview.Enabled {
-			urls := extractURLs(text, b.cfg.LinkPreview.MaxURLs)
-			if len(urls) > 0 {
-				ctx, cancel := context.WithTimeout(context.Background(), b.cfg.LinkPreview.Timeout)
-				defer cancel()
-
-				var wg sync.WaitGroup
-				mu := sync.Mutex{}
-				var previews []*event.LinkPreview
-
-				for _, u := range urls {
-					wg.Add(1)
-					go func(rawURL string) {
-						defer wg.Done()
-						preview, err := b.client.GetURLPreview(ctx, rawURL)
-						if err != nil {
-							log.Printf("Failed to get preview for %s: %v", rawURL, err)
-							return
-						}
-						mu.Lock()
-						previews = append(previews, preview)
-						mu.Unlock()
-					}(u)
-				}
-
-				wg.Wait()
-				text = buildTextWithPreviews(text, previews)
-			}
+			previews := b.fetchPreviews(text)
+			text = buildTextWithPreviews(text, previews)
 		}
 
 		msg := indexer.PendingMessage{
@@ -509,7 +542,7 @@ func (b *Bot) handleEvent(ev *event.Event) {
 			UserID:    ev.Sender.String(),
 			Timestamp: ev.Timestamp,
 			RawURL:    string(body.URL),
-			FileName:  body.FileName,
+			FileName:  body.Body,
 			MimeType:  body.Info.MimeType,
 		}
 
@@ -624,21 +657,21 @@ func (b *Bot) sendReplyHTML(roomID id.RoomID, parentEventID id.EventID, text, ht
 // Auto-joins the bot when it receives an invite.
 func (b *Bot) handleMembershipEvent(ev *event.Event) {
 	content := ev.Content.Parsed.(*event.MemberEventContent)
-	
+
 	// Only handle invites to the bot itself
 	if content.Membership != event.MembershipInvite || ev.StateKey != &b.cfg.Bot.UserID {
 		return
 	}
-	
+
 	log.Printf("Bot invited to room %s by %s, joining...", ev.RoomID, *ev.StateKey)
-	
+
 	// Join the room
 	resp, err := b.client.JoinRoom(context.Background(), ev.RoomID.String(), nil)
 	if err != nil {
 		log.Printf("Failed to join room %s: %v", ev.RoomID, err)
 		return
 	}
-	
+
 	log.Printf("Bot joined room %s (new room ID: %s)", ev.RoomID, resp.RoomID)
 }
 
@@ -651,9 +684,9 @@ func (b *Bot) handleSyncResponse(ctx context.Context, resp *mautrix.RespSync, si
 		if b.joinedInviteRooms[roomID.String()] {
 			continue
 		}
-		
+
 		log.Printf("Bot has invite to room %s, joining...", roomID)
-		
+
 		// For remote rooms, provide the server via Via
 		var req *mautrix.ReqJoinRoom
 		if strings.Contains(roomID.String(), ":") {
@@ -661,11 +694,11 @@ func (b *Bot) handleSyncResponse(ctx context.Context, resp *mautrix.RespSync, si
 			if len(parts) == 2 {
 				req = &mautrix.ReqJoinRoom{
 					Reason: "Auto-joining via bot sync handler",
-					Via: []string{parts[1]},
+					Via:    []string{parts[1]},
 				}
 			}
 		}
-		
+
 		joinResp, err := b.client.JoinRoom(ctx, roomID.String(), req)
 		if err != nil {
 			log.Printf("Failed to join room %s: %v", roomID, err)
@@ -673,11 +706,11 @@ func (b *Bot) handleSyncResponse(ctx context.Context, resp *mautrix.RespSync, si
 			b.joinedInviteRooms[roomID.String()] = true
 			continue
 		}
-		
+
 		b.joinedInviteRooms[roomID.String()] = true
 		log.Printf("Joined room %s (new room ID: %s)", roomID, joinResp.RoomID)
 	}
-	
+
 	// Auto-leave rooms where the bot is the only member
 	// Only check rooms in resp.Rooms.Join — resp.Rooms.Leave contains rooms the bot already left
 	for roomID := range resp.Rooms.Join {
@@ -687,7 +720,7 @@ func (b *Bot) handleSyncResponse(ctx context.Context, resp *mautrix.RespSync, si
 			log.Printf("Failed to get joined members for room %s: %v", roomID, err)
 			continue
 		}
-		
+
 		if len(membersResp.Joined) == 1 {
 			// Only the bot is in the room — leave it
 			log.Printf("Bot is the only member in room %s, leaving...", roomID)
@@ -699,7 +732,7 @@ func (b *Bot) handleSyncResponse(ctx context.Context, resp *mautrix.RespSync, si
 			}
 		}
 	}
-	
+
 	return true
 }
 
@@ -743,4 +776,167 @@ func (b *Bot) Stop() {
 	b.batchIndexer.Stop()
 	b.bleveClient.Close()
 	b.client.StopSync()
+}
+
+// fetchPreviews extracts URLs from text, skips preview hosts, and fetches previews
+// via the Matrix client's GetURLPreview API.
+func (b *Bot) fetchPreviews(text string) []*event.LinkPreview {
+	urls := extractURLs(text, b.cfg.LinkPreview.MaxURLs)
+	if len(urls) == 0 {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), b.cfg.LinkPreview.Timeout)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	mu := sync.Mutex{}
+	var previews []*event.LinkPreview
+
+	for _, u := range urls {
+		wg.Add(1)
+		go func(rawURL string) {
+			defer wg.Done()
+			preview, err := b.client.GetURLPreview(ctx, rawURL)
+			if err != nil {
+				log.Printf("Failed to get preview for %s: %v", rawURL, err)
+				return
+			}
+			mu.Lock()
+			previews = append(previews, preview)
+			mu.Unlock()
+		}(u)
+	}
+
+	wg.Wait()
+	return previews
+}
+
+// ScanRoomHistory scans a room's message history backwards from the present
+// and indexes new messages until a cutoff date, room start, or stale pages threshold is reached.
+func (b *Bot) ScanRoomHistory(roomID string, cutoffUnix int64) {
+	var textsIndexed int
+	var imagesDeferred int
+	var pagesScanned int
+	stalePages := 0
+	from := ""
+
+	log.Printf("INFO bot: starting history scan for room %s (cutoff: %d)", roomID, cutoffUnix)
+
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		resp, err := b.client.Messages(ctx, id.RoomID(roomID), from, "", mautrix.Direction('b'), nil, 100)
+		cancel()
+
+		if err != nil {
+			log.Printf("WARN bot: failed to fetch messages for room %s: %v", roomID, err)
+			break
+		}
+
+		if len(resp.Chunk) == 0 {
+			break
+		}
+
+		events := make([]*event.Event, len(resp.Chunk))
+		copy(events, resp.Chunk)
+		for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
+			events[i], events[j] = events[j], events[i]
+		}
+
+		newestTs := events[len(events)-1].Timestamp
+		if cutoffUnix > 0 && newestTs/1000 <= cutoffUnix {
+			break
+		}
+
+		hasNewEvents := false
+		hasProcessableEvents := false
+		for _, ev := range events {
+			eventTime := time.UnixMilli(ev.Timestamp)
+			if cutoffUnix > 0 && eventTime.Unix() <= cutoffUnix {
+				continue
+			}
+			if ev.Sender.String() == b.cfg.Bot.UserID {
+				textsIndexed += b.batchIndexer.FlushRoom(ev.RoomID.String())
+				continue
+			}
+			if ev.Type.Type != event.EventMessage.Type {
+				continue
+			}
+			if err := ev.Content.ParseRaw(ev.Type); err != nil {
+				continue
+			}
+			body, ok := ev.Content.Parsed.(*event.MessageEventContent)
+			if !ok {
+				continue
+			}
+			if body.MsgType == event.MsgText && len(body.Body) > 0 && body.Body[0] == '!' {
+				textsIndexed += b.batchIndexer.FlushRoom(ev.RoomID.String())
+				continue
+			}
+
+			hasProcessableEvents = true
+
+			switch body.MsgType {
+			case event.MsgText:
+				text := body.Body
+				if b.cfg.LinkPreview.Enabled {
+					previews := b.fetchPreviews(text)
+					text = buildTextWithPreviews(text, previews)
+				}
+				msg := indexer.PendingMessage{
+					EventID:   ev.ID.String(),
+					RoomID:    ev.RoomID.String(),
+					UserID:    ev.Sender.String(),
+					Timestamp: ev.Timestamp,
+					EventType: "m.room.message",
+					Text:      text,
+				}
+				textsIndexed += b.batchIndexer.OnTextMessageWithBuffering(msg)
+				hasNewEvents = true
+			case event.MsgImage:
+				img := indexer.PendingImage{
+					EventID:   ev.ID.String(),
+					RoomID:    ev.RoomID.String(),
+					UserID:    ev.Sender.String(),
+					Timestamp: ev.Timestamp,
+					RawURL:    string(body.URL),
+					FileName:  body.Body,
+					MimeType:  body.Info.MimeType,
+				}
+				b.batchIndexer.OnImageMessage(img)
+				imagesDeferred++
+				hasNewEvents = true
+			}
+		}
+
+		pagesScanned++
+
+		if !hasProcessableEvents {
+			from = resp.End
+			if from == "" && len(events) > 0 {
+				break
+			}
+			continue
+		}
+
+		if hasNewEvents {
+			stalePages = 0
+		} else {
+			stalePages++
+			if stalePages >= b.cfg.HistoryScan.StalePagesThreshold {
+				log.Printf("INFO bot: reached stale pages threshold (%d) for room %s", stalePages, roomID)
+				break
+			}
+		}
+
+		from = resp.End
+		if from == "" && len(events) > 0 {
+			break
+		}
+	}
+
+	flushed := b.batchIndexer.FlushBufferedMessages()
+	textsIndexed += flushed
+
+	log.Printf("INFO bot: scanned room %s: %d texts indexed, %d images deferred, %d pages scanned", roomID, textsIndexed, imagesDeferred, pagesScanned)
 }

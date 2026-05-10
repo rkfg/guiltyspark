@@ -7,7 +7,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/blevesearch/bleve/v2"
 	"github.com/blevesearch/bleve/v2/search"
 	"github.com/rkfg/guiltyspark/config"
 	"github.com/rkfg/guiltyspark/indexer"
@@ -34,17 +33,16 @@ type SearchResult struct {
 	QueryVector []float32
 }
 
+type EmbedClient interface {
+	CreateEmbedding(text string) ([]float32, error)
+}
 type Engine struct {
 	bleveClient *indexer.BleveClient
-	embedClient interface {
-		CreateEmbedding(text string) ([]float32, error)
-	}
-	cfg *config.SearchConfig
+	embedClient EmbedClient
+	cfg         *config.SearchConfig
 }
 
-func NewEngine(bleveClient *indexer.BleveClient, embedClient interface {
-	CreateEmbedding(text string) ([]float32, error)
-}, cfg *config.SearchConfig) *Engine {
+func NewEngine(bleveClient *indexer.BleveClient, embedClient EmbedClient, cfg *config.SearchConfig) *Engine {
 	return &Engine{
 		bleveClient: bleveClient,
 		embedClient: embedClient,
@@ -75,8 +73,8 @@ const (
 	imageTruncateLen = 200
 	defaultLimit     = 5
 
-	noResultsText     = "No results found."
-	noSemanticText    = "No semantic results found."
+	noResultsText  = "No results found."
+	noSemanticText = "No semantic results found."
 )
 
 func filterStopWords(query string) string {
@@ -136,13 +134,6 @@ func (e *Engine) prepareQuery(queryText string) (string, []float32) {
 	}
 	log.Printf("INFO search: query=%q filtered=%q embedding dims=%d first3=%v", queryText, filteredQuery, len(vector), vector[:min(3, len(vector))])
 	return filteredQuery, vector
-}
-
-func logSemanticHits(semanticResults *bleve.SearchResult, limit int) {
-	log.Printf("INFO search: semantic total=%d (limit=%d)", len(semanticResults.Hits), limit)
-	for i, hit := range semanticResults.Hits {
-		log.Printf("INFO search:   semantic hit[%d] id=%s score=%.6f", i, hit.ID, hit.Score)
-	}
 }
 
 func appendFormattedResults(textParts, htmlParts []string, results []Result, sectionHeaderText, sectionHeaderHTML string) ([]string, []string) {
@@ -213,8 +204,6 @@ func (e *Engine) Search(queryText string, roomFilter, userFilter string) (*Searc
 		return nil, fmt.Errorf("semantic search: %w", err)
 	}
 
-	logSemanticHits(semanticResults, e.cfg.ResultLimit)
-
 	result.Semantic = filterHitsByUserAndRoom(semanticResults.Hits, roomFilter, userFilter)
 	result.Semantic = limitResults(result.Semantic, e.cfg.ResultLimit)
 	log.Printf("INFO search: semantic results=%d (limit=%d)", len(result.Semantic), e.cfg.ResultLimit)
@@ -251,8 +240,6 @@ func (e *Engine) SemanticSearch(queryText string, roomFilter, userFilter string)
 	if err != nil {
 		return nil, fmt.Errorf("semantic search: %w", err)
 	}
-
-	logSemanticHits(semanticResults, e.cfg.ResultLimit)
 
 	result.Semantic = filterHitsByUserAndRoom(semanticResults.Hits, roomFilter, userFilter)
 	result.Semantic = limitResults(result.Semantic, e.cfg.ResultLimit)

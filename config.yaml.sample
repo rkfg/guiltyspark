@@ -55,3 +55,14 @@ link_preview:
   enabled: true
   timeout: 5s
   max_urls: 5
+
+history_scan:
+  # Stop after N consecutive pages where all events are already indexed
+  stale_pages_threshold: 3
+
+rooms:
+  # Room with history scan — bot will scan messages back to the specified date (DD.MM.YYYY)
+  # "!roomid:server.org":
+  #   history_scan_cutoff: "01.06.2025"
+  # "#roomalias:server.org":
+  #   history_scan_cutoff: "01.01.2025"

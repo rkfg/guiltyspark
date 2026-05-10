@@ -33,56 +33,36 @@ func (p *ImageProcessor) SetHomeserver(homeserver, accessToken string) {
 	p.accessToken = accessToken
 }
 
-type ImageResult struct {
-	Description string
-	Vector      []float32
-}
-
-func (p *ImageProcessor) ProcessImage(mxcURL, roomID, userID, eventID string, timestamp int64, rawURL, fileName, mimeType string) (*ImageResult, error) {
-	// Download image
+func (p *ImageProcessor) DescribeImageOnly(mxcURL string, timestamp int64) (string, error) {
 	imgData, err := p.downloadImage(mxcURL)
 	if err != nil {
-		return nil, fmt.Errorf("download image: %w", err)
+		return "", fmt.Errorf("download image: %w", err)
 	}
 
-	// Save to temp file
 	tmpDir := p.cfg.CacheDir
 	if err := os.MkdirAll(tmpDir, 0755); err != nil {
-		return nil, fmt.Errorf("create cache dir: %w", err)
+		return "", fmt.Errorf("create cache dir: %w", err)
 	}
 
 	tmpFile := filepath.Join(tmpDir, fmt.Sprintf("img_%d.jpg", timestamp))
 
-	// Convert to JPG via ImageMagick with optional resize
 	if err := p.convertImage(imgData, tmpFile); err != nil {
-		return nil, fmt.Errorf("convert image: %w", err)
+		return "", fmt.Errorf("convert image: %w", err)
 	}
 
-	// Read and encode for VLM
 	base64Data, encodedMime, err := embedding.ReadAndEncodeImage(tmpFile)
 	if err != nil {
-		return nil, fmt.Errorf("encode image: %w", err)
+		os.Remove(tmpFile)
+		return "", fmt.Errorf("encode image: %w", err)
 	}
 
-	// Get VLM description
 	description, err := p.embedClient.DescribeImage(base64Data, encodedMime)
-	if err != nil {
-		return nil, fmt.Errorf("describe image: %w", err)
-	}
-
-	// Create embedding for description
-	vector, err := p.embedClient.CreateEmbedding(description)
-	if err != nil {
-		return nil, fmt.Errorf("embed image description: %w", err)
-	}
-
-	// Clean up temp file
 	os.Remove(tmpFile)
+	if err != nil {
+		return "", fmt.Errorf("describe image: %w", err)
+	}
 
-	return &ImageResult{
-		Description: description,
-		Vector:      vector,
-	}, nil
+	return description, nil
 }
 
 func (p *ImageProcessor) downloadImage(mxcURL string) ([]byte, error) {

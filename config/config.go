@@ -16,7 +16,9 @@ type Config struct {
 	ImageProc    ImageProcConfig    `yaml:"image_processing"`
 	Retry        RetryConfig        `yaml:"retry"`
 	LinkPreview  LinkPreviewConfig `yaml:"link_preview"`
+	HistoryScan  HistoryScanConfig `yaml:"history_scan"`
 	StoragePath  string             `yaml:"storage_path"`
+	Rooms        map[string]*RoomConfig `yaml:"rooms"`
 }
 
 type BotConfig struct {
@@ -66,6 +68,22 @@ type RetryConfig struct {
 	Multiplier   float64       `yaml:"multiplier"`
 	MaxRetries   int           `yaml:"max_retries"`
 	Timeout      time.Duration `yaml:"timeout"`
+}
+
+type HistoryScanConfig struct {
+	StalePagesThreshold int `yaml:"stale_pages_threshold"`
+}
+
+type RoomConfig struct {
+	HistoryScanCutoff string `yaml:"history_scan_cutoff"` // "01.02.2006"
+	ScanCutoffUnix    int64  `yaml:"-"`
+}
+
+func (c *Config) GetRoomConfig(roomID string) *RoomConfig {
+	if c.Rooms == nil {
+		return nil
+	}
+	return c.Rooms[roomID]
 }
 
 func Load(path string) (*Config, error) {
@@ -158,6 +176,20 @@ func (c *Config) Validate() error {
 	}
 	if c.Indexing.DelayedEmbedMinute == 0 {
 		c.Indexing.DelayedEmbedMinute = 0
+	}
+	if c.HistoryScan.StalePagesThreshold == 0 {
+		c.HistoryScan.StalePagesThreshold = 3
+	}
+	if c.Rooms != nil {
+		for roomID, roomCfg := range c.Rooms {
+			if roomCfg.HistoryScanCutoff != "" {
+				cutoff, err := time.Parse("02.01.2006", roomCfg.HistoryScanCutoff)
+				if err != nil {
+					return fmt.Errorf("room %s: invalid history_scan_cutoff %q: %w", roomID, roomCfg.HistoryScanCutoff, err)
+				}
+				roomCfg.ScanCutoffUnix = cutoff.Unix()
+			}
+		}
 	}
 	return nil
 }
