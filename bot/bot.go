@@ -304,6 +304,24 @@ var roomAliasRegex = regexp.MustCompile(`(?:https?://matrix\.to/#/|#|!)([\w-]+):
 // userAliasRegex matches user IDs like @user:server.
 var userAliasRegex = regexp.MustCompile(`(?:https?://matrix\.to/#/@|@)([\w.]+):([\w.]+)`)
 
+// stripCommandAlias removes a command alias prefix from the beginning of text.
+// Handles both "!alias query" and "alias query" (when ! was already stripped).
+func stripCommandAlias(text, command string) string {
+	if text == "" || command == "" {
+		return text
+	}
+	allAliases := commandAliases[command]
+	candidates := append([]string{command}, allAliases...)
+	for _, alias := range candidates {
+		for _, prefix := range []string{alias + " ", "!" + alias + " "} {
+			if strings.HasPrefix(text, prefix) {
+				return strings.TrimSpace(strings.TrimPrefix(text, prefix))
+			}
+		}
+	}
+	return text
+}
+
 // UserRef contains a resolved user ID and the cleaned text.
 type UserRef struct {
 	UserID string
@@ -366,8 +384,9 @@ func (b *Bot) resolveRoomFromText(text string) (string, string) {
 }
 
 // parseRoomAndUserFromHTML extracts room alias and user ID from HTML body.
-// Returns resolved room ID, resolved user ID, and cleaned HTML without the links.
-func (b *Bot) parseRoomAndUserFromHTML(html string) (string, string, string) {
+// Returns resolved room ID, resolved user ID, and cleaned HTML without the links
+// and command alias prefix.
+func (b *Bot) parseRoomAndUserFromHTML(html, command string) (string, string, string) {
 	// Extract room aliases from full <a href="https://matrix.to/#/#room:server">...</a> links
 	roomLinkRegex := regexp.MustCompile(`<a[^>]+href="https?://matrix\.to/#/(#[^"]+)"[^>]*>.*?</a>`)
 	userLinkRegex := regexp.MustCompile(`<a[^>]+href="https?://matrix\.to/#/(@[^"]+)"[^>]*>.*?</a>`)
@@ -398,6 +417,9 @@ func (b *Bot) parseRoomAndUserFromHTML(html string) (string, string, string) {
 		// Remove the full link tag from HTML
 		cleanedHTML = userLinkRegex.ReplaceAllString(cleanedHTML, "")
 	}
+
+	// Strip command alias prefix (e.g. "!с" or "!s") from cleaned HTML
+	cleanedHTML = stripCommandAlias(cleanedHTML, command)
 
 	cleanedHTML = strings.TrimSpace(cleanedHTML)
 
@@ -473,10 +495,12 @@ func (b *Bot) handleEvent(ev *event.Event) {
 
 				if formattedBody != "" {
 					// Extract room and user from HTML
-					searchRoomID, searchUser, formattedBody = b.parseRoomAndUserFromHTML(formattedBody)
+					searchRoomID, searchUser, formattedBody = b.parseRoomAndUserFromHTML(formattedBody, cmd)
 					args = formattedBody
 				} else {
-					// Fall back to body text
+					// Strip command alias from args before room resolution so the regex
+					// doesn't match the alias (e.g. "s:room_name" instead of "#room_name:server").
+					args = stripCommandAlias(args, cmd)
 					if resolvedRoomID, cleanedText := b.resolveRoomFromText(args); resolvedRoomID != "" {
 						searchRoomID = resolvedRoomID
 						args = cleanedText
@@ -980,10 +1004,11 @@ func (b *Bot) ScanRoomHistory(roomID string, cutoffUnix int64) {
 					FileName:  body.Body,
 					MimeType:  body.Info.MimeType,
 				}
-				b.batchIndexer.OnImageMessage(img)
+				if b.batchIndexer.OnImageMessage(img) {
 				imagesDeferred++
 				hasNewEvents = true
 			}
+		}
 		}
 
 		pagesScanned++
