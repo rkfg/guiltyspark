@@ -992,8 +992,11 @@ func (b *Bot) ScanRoomHistory(roomID string, cutoffUnix int64) {
 					EventType: "m.room.message",
 					Text:      text,
 				}
-				textsIndexed += b.batchIndexer.OnTextMessageWithBuffering(msg)
-				hasNewEvents = true
+				indexed := b.batchIndexer.OnTextMessageWithBuffering(msg)
+				textsIndexed += indexed
+				if indexed > 0 {
+					hasNewEvents = true
+				}
 			case event.MsgImage:
 				img := indexer.PendingImage{
 					EventID:   ev.ID.String(),
@@ -1004,11 +1007,10 @@ func (b *Bot) ScanRoomHistory(roomID string, cutoffUnix int64) {
 					FileName:  body.Body,
 					MimeType:  body.Info.MimeType,
 				}
-				if b.batchIndexer.OnImageMessage(img) {
+				b.batchIndexer.OnImageMessage(img)
 				imagesDeferred++
 				hasNewEvents = true
 			}
-		}
 		}
 
 		pagesScanned++
