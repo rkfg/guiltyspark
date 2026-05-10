@@ -26,7 +26,7 @@ go build -tags vectors ./cmd/bot/
 Изображения обрабатываются по расписанию:
 1. При получении — добавляются в `deferredImages` и сохраняются в `deferred.json`
 2. При скачивании — конвертируются, ресайзятся, кэшируются
-3. Embedding создаётся в ночное время через VLM в `ProcessDeferredFn`
+3. В ночное время сначала генерируются описания через VLM (`ProcessImageDescFn`), затем создаются эмбеддинги (`ProcessImageEmbedFn`)
 
 **Deduplication:** по `EventID` для изображений и текстов в `deferredImages`/`deferredTextEmbed`.
 
