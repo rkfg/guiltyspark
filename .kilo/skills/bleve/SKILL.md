@@ -52,18 +52,19 @@ Use `DefaultMapping` + explicit `AddFieldMappingsAt` overrides. All fields are i
 
 ## Searching
 
-### `IsEventIndexed` — query by `event_id` field
+### `IsEventIDExists` — check processedEvents index (dedup)
 ```go
-func (b *BleveClient) IsEventIndexed(eventID string) (bool, error) {
-    q := bleve.NewMatchQuery(eventID)
+func (b *BleveClient) IsEventIDExists(eventID string) (bool, error) {
+    q := bleve.NewTermQuery(eventID)
     q.SetField("event_id")
     searchReq := bleve.NewSearchRequest(q)
     searchReq.Size = 1
-    result, err := b.index.Search(searchReq)
+    result, err := b.eventIDIndex.Search(searchReq)
     if err != nil { return false, err }
     return result.Total > 0, nil
 }
 ```
+**Uses `b.eventIDIndex` (`.eventid` directory), NOT `b.index`.** This is the `processedEvents` index where `AddEventID` stores event IDs for deduplication. Do NOT use `b.index.Search()` for this check.
 
 ### `SearchExact` — text search with optional room filter
 ```go

@@ -225,8 +225,10 @@ func resolveRoomKeyToID(key string) (id.RoomID, error) {
 ### `Messages()` returns raw events — `Content.Parsed` is NOT populated
 `b.client.Messages()` returns events as raw JSON from the server API. Unlike events received via `/sync` where `ev.Content.Parsed` is pre-filled by `DefaultSyncer`, events from `Messages()` have `Parsed == nil`. **Always call `ev.Content.ParseRaw(ev.Type)` before casting `Content.Parsed`** to any content struct. Without this, the type assertion always fails silently.
 
-### Stale page counting — only count pages with processable events
-When scanning room history, a page may contain only bot messages, commands, or non-message events (state, membership, room creation, etc.). Such pages must NOT count as stale because there may be unindexed user messages further back. Track `hasProcessableEvents` (user text messages and images, post-cutoff, non-bot) and only increment the stale counter when the page had at least one processable event and all of them were already indexed.
+### Stale page counting — stop after N consecutive pages with no new documents indexed
+When scanning room history backwards, a page counts as "stale" if it produced zero newly indexed documents (`hasNewEvents == false`). This includes pages with only already-indexed events, bot messages, commands, non-message events, or events before cutoff. The scan stops when `stalePages >= StalePagesThreshold` (default 3).
+
+**Critical:** `hasNewEvents` must reflect actual dedup-checked additions, not just "we sent something to a channel". For images, use `BatchIndexer.QueueImage()` (sync, returns bool) — `OnImageMessage()` is async (channel) and always "succeeds", so it can't distinguish already-queued images from new ones. `QueueImage` + `isIndexed` (local O(1) cache in BleveClient) provides correct dedup without O(n) linear scans.
 
 ### API method name
 The method is `Messages()` not `RoomMessages()`. `RoomMessages` exists only in `synapseadmin` package as an alias to `RespMessages`.

@@ -23,6 +23,11 @@ type BleveClient struct {
 	// eventIDBuf accumulates event IDs for batched storage.
 	eventIDBuf    []string
 	eventIDBufLen int
+
+	// processedEventIDs is a local cache of event IDs already added to the index.
+	// Used for O(1) dedup checks without hitting Bleve.
+	// Cleared after flushEventIDBatchLocked to allow Bleve to be the source of truth.
+	processedEventIDs map[string]bool
 }
 
 func NewBleveClient(indexPath string, vectorDims int) (*BleveClient, error) {
@@ -81,7 +86,7 @@ func NewBleveClient(indexPath string, vectorDims int) (*BleveClient, error) {
 		log.Printf("INFO bleve: Opened existing processedEvents index at %s.eventid", indexPath)
 	}
 
-	return &BleveClient{index: index, eventIDIndex: eventIDIndex}, nil
+	return &BleveClient{index: index, eventIDIndex: eventIDIndex, processedEventIDs: make(map[string]bool)}, nil
 }
 
 func (b *BleveClient) Close() error {
@@ -193,22 +198,12 @@ func (b *BleveClient) SearchSemantic(queryVector []float32, roomID string) (*ble
 	return result, nil
 }
 
-func (b *BleveClient) IsEventIndexed(eventID string) (bool, error) {
-	q := bleve.NewTermQuery(eventID)
-	q.SetField("event_id")
-	searchReq := bleve.NewSearchRequest(q)
-	searchReq.Size = 1
-	result, err := b.index.Search(searchReq)
-	if err != nil {
-		return false, err
-	}
-	return result.Total > 0, nil
-}
-
 // AddEventID stores an event ID in the processedEvents index for deduplication.
 // Buffers event IDs and flushes in batches to reduce disk I/O.
+// Also adds to local cache for O(1) dedup checks.
 func (b *BleveClient) AddEventID(eventID string) error {
 	b.mu.Lock()
+	b.processedEventIDs[eventID] = true
 	b.eventIDBufLen++
 	if b.eventIDBufLen > cap(b.eventIDBuf) {
 		newBuf := make([]string, len(b.eventIDBuf)+50)
@@ -237,11 +232,16 @@ func (b *BleveClient) flushEventIDBatchLocked() error {
 		}
 	}
 	b.eventIDBufLen = 0
+	clear(b.processedEventIDs)
 	return b.eventIDIndex.Batch(batch)
 }
 
 // IsEventIDExists checks if an event ID exists in the processedEvents index.
+// Checks local cache first (O(1)), falls back to Bleve query.
 func (b *BleveClient) IsEventIDExists(eventID string) (bool, error) {
+	if b.processedEventIDs[eventID] {
+		return true, nil
+	}
 	q := bleve.NewTermQuery(eventID)
 	q.SetField("event_id")
 	searchReq := bleve.NewSearchRequest(q)

@@ -87,7 +87,7 @@ func New(cfg *config.Config) (*Bot, error) {
 		return nil
 	}
 	batchIndexer.IsIndexedFn = func(eventID string) (bool, error) {
-		return bleveClient.IsEventIndexed(eventID)
+		return bleveClient.IsEventIDExists(eventID)
 	}
 	batchIndexer.AddEventIDFn = func(eventID string) error {
 		return bleveClient.AddEventID(eventID)
@@ -1007,9 +1007,10 @@ func (b *Bot) ScanRoomHistory(roomID string, cutoffUnix int64) {
 					FileName:  body.Body,
 					MimeType:  body.Info.MimeType,
 				}
-				b.batchIndexer.OnImageMessage(img)
-				imagesDeferred++
-				hasNewEvents = true
+				if added := b.batchIndexer.QueueImage(img); added {
+					imagesDeferred++
+					hasNewEvents = true
+				}
 			}
 		}
 

@@ -209,9 +209,7 @@ func (b *BatchIndexer) flushBufferLocked(buf *messageBuffer) int {
 				}
 			}
 		}
-		if !b.hasDeferredText(buf.firstEventID) {
-			b.deferredTextEmbed = append(b.deferredTextEmbed, msg)
-		}
+		b.deferredTextEmbed = append(b.deferredTextEmbed, msg)
 		return 1
 	}
 	return 0
@@ -231,13 +229,29 @@ func (b *BatchIndexer) OnImageMessage(img PendingImage) {
 	}
 }
 
+// QueueImage synchronously enqueues an image for deferred processing.
+// Returns true if the image was added (false if already indexed).
+// Used during history scan where sync dedup check is needed.
+func (b *BatchIndexer) QueueImage(img PendingImage) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.isIndexed(img.EventID) {
+		return false
+	}
+	b.deferredImages = append(b.deferredImages, img)
+	if b.AddEventIDFn != nil {
+		_ = b.AddEventIDFn(img.EventID)
+	}
+	return true
+}
+
 func (b *BatchIndexer) ingestLoop() {
 	defer b.wg.Done()
 	for {
 		select {
 		case img := <-b.imageCh:
 			b.mu.Lock()
-			if !b.hasDeferredImage(img.EventID) && !b.isIndexed(img.EventID) {
+			if !b.isIndexed(img.EventID) {
 				b.deferredImages = append(b.deferredImages, img)
 				if b.AddEventIDFn != nil {
 					_ = b.AddEventIDFn(img.EventID)
@@ -255,24 +269,6 @@ func (b *BatchIndexer) isIndexed(eventID string) bool {
 	if b.IsIndexedFn != nil {
 		indexed, _ := b.IsIndexedFn(eventID)
 		return indexed
-	}
-	return false
-}
-
-func (b *BatchIndexer) hasDeferredImage(eventID string) bool {
-	for _, img := range b.deferredImages {
-		if img.EventID == eventID {
-			return true
-		}
-	}
-	return false
-}
-
-func (b *BatchIndexer) hasDeferredText(eventID string) bool {
-	for _, msg := range b.deferredTextEmbed {
-		if msg.EventID == eventID {
-			return true
-		}
 	}
 	return false
 }
