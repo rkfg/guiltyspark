@@ -54,7 +54,7 @@ func (c *Client) CreateEmbedding(text string) ([]float32, error) {
 	for attempt := 0; c.backoff.ShouldRetry(attempt); attempt++ {
 		if attempt > 0 {
 			delay := c.backoff.GetDelay(attempt)
-			log.Printf("DEBUG embedding: retry attempt %d after %v", attempt, delay)
+			log.Printf("WARN embedding: retry attempt %d after %v", attempt, delay)
 			time.Sleep(delay)
 		}
 
@@ -159,7 +159,7 @@ func (c *Client) DescribeImage(base64Data string, mimeType string) (string, erro
 	for attempt := 0; c.backoff.ShouldRetry(attempt); attempt++ {
 		if attempt > 0 {
 			delay := c.backoff.GetDelay(attempt)
-			log.Printf("DEBUG embedding: retry DescribeImage attempt %d after %v", attempt, delay)
+			log.Printf("WARN embedding: retry DescribeImage attempt %d after %v", attempt, delay)
 			time.Sleep(delay)
 		}
 

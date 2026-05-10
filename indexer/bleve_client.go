@@ -178,9 +178,6 @@ func (b *BleveClient) SearchSemantic(queryVector []float32, roomID string) (*ble
 	searchReq.Size = 5
 	searchReq.Fields = []string{"text", "image_desc", "user_id", "room_id", "timestamp", "event_id", "raw_url", "file_name", "mime_type"}
 
-	// Log query vector for debugging
-	log.Printf("INFO bleve: SearchSemantic queryVector dims=%d first5=%v", len(queryVector), queryVector[:min(5, len(queryVector))])
-
 	// Use plain kNN without pre-filter to preserve original search behavior.
 	// Room filtering is applied post-search (in search.Engine.Search).
 	searchReq.AddKNN("vector", queryVector, 5, 1.0)
@@ -189,12 +186,6 @@ func (b *BleveClient) SearchSemantic(queryVector []float32, roomID string) (*ble
 	if err != nil {
 		return nil, err
 	}
-
-	log.Printf("INFO bleve: SearchSemantic result total=%d hits=%d", result.Total, len(result.Hits))
-	for i, hit := range result.Hits {
-		log.Printf("INFO bleve:   hit[%d] id=%s score=%.6f", i, hit.ID, hit.Score)
-	}
-
 	return result, nil
 }
 
