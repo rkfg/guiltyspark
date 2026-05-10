@@ -158,6 +158,11 @@ func formatResult(r Result, idx int) (string, string) {
 	ts := formatTimestamp(r.Timestamp)
 	fmt.Fprintf(&textLine, "%d. %s", idx, ts)
 	fmt.Fprintf(&htmlLine, "%d. %s %s", idx, ts, eventLink)
+	if r.UserID != "" {
+		textLabel, htmlLink := formatAuthor(r.UserID)
+		fmt.Fprintf(&textLine, " by %s", textLabel)
+		fmt.Fprintf(&htmlLine, " by %s", htmlLink)
+	}
 	if r.Score > 0 {
 		fmt.Fprintf(&textLine, " (score: %.4f)", r.Score)
 		fmt.Fprintf(&htmlLine, " <i>score: %.4f</i>", r.Score)
@@ -305,6 +310,18 @@ func (e *Engine) FormatSemanticResults(result *SearchResult) (text, html string)
 
 func formatTimestamp(ts int64) string {
 	return time.UnixMilli(ts).Format("2006-01-02 15:04:05")
+}
+
+func formatAuthor(userID string) (textLabel, htmlLink string) {
+	if userID == "" {
+		return "", ""
+	}
+	parts := strings.SplitN(userID, ":", 2)
+	if len(parts) == 2 {
+		localpart := parts[0]
+		return localpart, fmt.Sprintf(`<a href="https://matrix.to/#/%s">%s</a>`, userID, localpart)
+	}
+	return userID, fmt.Sprintf(`<a href="https://matrix.to/#/%s">%s</a>`, userID, userID)
 }
 
 func truncate(s string, maxLen int) string {
