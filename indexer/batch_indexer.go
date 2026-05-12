@@ -45,6 +45,10 @@ type BatchIndexer struct {
 	IsIndexedFn  func(eventID string) (bool, error)
 	AddEventIDFn func(eventID string) error
 
+	// Flush callbacks for live message indexing (immediate visibility in search)
+	FlushFn      func() error
+	FlushEventIDFn func() error
+
 	// Deferred processing
 	ProcessImageDescFn func(images []PendingImage) ([]PendingImage, error)
 	ProcessImageEmbedFn func(images []PendingImage) ([]PendingImage, error)
@@ -158,14 +162,17 @@ func (b *BatchIndexer) loadDeferred() {
 // OnTextMessageWithBuffering accumulates consecutive messages from the same user in the same room.
 // Buffer is keyed by roomID. When a different user writes in the same room, the previous buffer is flushed.
 // Same user writing again: appends to existing buffer, re-indexes.
+// If isLive is true, dedup check is skipped so live messages can re-index with updated text (e.g. link previews).
 // Returns the number of documents actually indexed during this call.
-func (b *BatchIndexer) OnTextMessageWithBuffering(msg PendingMessage) int {
+func (b *BatchIndexer) OnTextMessageWithBuffering(msg PendingMessage, isLive bool) int {
 	b.mu.Lock()
 
 	var count int
 
+	// Flush any existing buffer before processing the new message
 	if existing, exists := b.msgBuffer[msg.RoomID]; exists {
-		if existing.UserID == msg.UserID {
+		// For same user during history scan, append to buffer (original buffering behavior)
+		if existing.UserID == msg.UserID && !isLive {
 			existing.text = existing.text + "\n" + msg.Text
 			existing.allEventIDs = append(existing.allEventIDs, msg.EventID)
 			existing.Timestamp = msg.Timestamp
@@ -173,10 +180,11 @@ func (b *BatchIndexer) OnTextMessageWithBuffering(msg PendingMessage) int {
 			b.mu.Unlock()
 			return 0
 		}
-		count = b.flushBufferLocked(existing)
+		count = b.flushBufferLocked(existing, isLive)
 		delete(b.msgBuffer, msg.RoomID)
 	}
 
+	// Create new buffer
 	b.msgBuffer[msg.RoomID] = &messageBuffer{
 		firstEventID: msg.EventID,
 		allEventIDs:  []string{msg.EventID},
@@ -186,6 +194,11 @@ func (b *BatchIndexer) OnTextMessageWithBuffering(msg PendingMessage) int {
 		Timestamp:    msg.Timestamp,
 	}
 
+	// For live messages, flush immediately to index the first message
+	if isLive {
+		count = b.flushBufferLocked(b.msgBuffer[msg.RoomID], true)
+	}
+
 	b.mu.Unlock()
 
 	return count
@@ -193,8 +206,9 @@ func (b *BatchIndexer) OnTextMessageWithBuffering(msg PendingMessage) int {
 
 // flushBufferLocked indexes the accumulated buffer and queues it for deferred embedding.
 // Must be called with b.mu held. Does NOT call saveDeferred — caller must do that after unlocking.
+// isLive controls whether dedup check is skipped (live messages re-index with updated text).
 // Returns 1 if the document was indexed, 0 if skipped (already indexed).
-func (b *BatchIndexer) flushBufferLocked(buf *messageBuffer) int {
+func (b *BatchIndexer) flushBufferLocked(buf *messageBuffer, isLive bool) int {
 	msg := PendingMessage{
 		EventID:   buf.firstEventID,
 		RoomID:    buf.RoomID,
@@ -203,13 +217,14 @@ func (b *BatchIndexer) flushBufferLocked(buf *messageBuffer) int {
 		EventType: "m.room.message",
 		Text:      buf.text,
 	}
-	if b.indexTextMessage(msg) {
-		// Mark all event IDs from this buffer as processed
-		if b.AddEventIDFn != nil {
-			for _, eid := range buf.allEventIDs {
-				if err := b.AddEventIDFn(eid); err != nil {
-					log.Printf("Failed to mark event ID %s as processed: %v", eid, err)
-				}
+	if b.indexTextMessage(msg, isLive) {
+		// Flush batches immediately for live messages so documents appear in search right away
+		if isLive {
+			if b.FlushFn != nil {
+				_ = b.FlushFn()
+			}
+			if b.FlushEventIDFn != nil {
+				_ = b.FlushEventIDFn()
 			}
 		}
 		b.deferredTextEmbed = append(b.deferredTextEmbed, msg)
@@ -377,6 +392,13 @@ func (b *BatchIndexer) deferredProcessingLoop() {
 			}
 			b.mu.Unlock()
 			b.saveDeferred()
+			// Flush all batches after deferred processing to persist indexed docs
+			if b.FlushFn != nil {
+				_ = b.FlushFn()
+			}
+			if b.FlushEventIDFn != nil {
+				_ = b.FlushEventIDFn()
+			}
 		case <-b.stopCh:
 			return
 		}
@@ -395,7 +417,7 @@ func (b *BatchIndexer) FlushRoom(roomID string) int {
 	b.mu.Lock()
 	var count int
 	if buf, exists := b.msgBuffer[roomID]; exists {
-		count = b.flushBufferLocked(buf)
+		count = b.flushBufferLocked(buf, false)
 		delete(b.msgBuffer, roomID)
 	}
 	b.mu.Unlock()
@@ -418,7 +440,7 @@ func (b *BatchIndexer) FlushBufferedMessages() int {
 		b.mu.Lock()
 		buf, exists := b.msgBuffer[key]
 		if exists {
-			flushed += b.flushBufferLocked(buf)
+			flushed += b.flushBufferLocked(buf, false)
 			delete(b.msgBuffer, key)
 		}
 		b.mu.Unlock()
@@ -426,8 +448,8 @@ func (b *BatchIndexer) FlushBufferedMessages() int {
 	return flushed
 }
 
-func (b *BatchIndexer) indexTextMessage(msg PendingMessage) bool {
-	if b.IsIndexedFn != nil {
+func (b *BatchIndexer) indexTextMessage(msg PendingMessage, isLive bool) bool {
+	if !isLive && b.IsIndexedFn != nil {
 		indexed, err := b.IsIndexedFn(msg.EventID)
 		if err != nil {
 			log.Printf("ERROR batch_indexer: IsIndexedFn error for event %s: %v", msg.EventID, err)

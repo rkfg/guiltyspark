@@ -176,12 +176,12 @@ func (b *BleveClient) SearchExact(queryText string, roomID string) (*bleve.Searc
 
 func (b *BleveClient) SearchSemantic(queryVector []float32, roomID string) (*bleve.SearchResult, error) {
 	searchReq := bleve.NewSearchRequest(bleve.NewMatchAllQuery())
-	searchReq.Size = 5
+	searchReq.Size = 50
 	searchReq.Fields = []string{"text", "image_desc", "user_id", "room_id", "timestamp", "event_id", "raw_url", "file_name", "mime_type"}
 
 	// Use plain kNN without pre-filter to preserve original search behavior.
 	// Room filtering is applied post-search (in search.Engine.Search).
-	searchReq.AddKNN("vector", queryVector, 5, 1.0)
+	searchReq.AddKNN("vector", queryVector, 50, 1.0)
 
 	result, err := b.index.Search(searchReq)
 	if err != nil {
@@ -269,4 +269,20 @@ func (b *BleveClient) BatchIndex(batch *bleve.Batch, doc IndexedDocument) error 
 
 func (b *BleveClient) ExecBatch(batch *bleve.Batch) error {
 	return b.index.Batch(batch)
+}
+
+// Flush persists any pending documents in the batch buffer to the Bleve index.
+// Called after live message indexing to make documents immediately searchable.
+func (b *BleveClient) Flush() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.flushBatchLocked()
+}
+
+// FlushEventID persists any pending event IDs in the batch buffer to the eventID index.
+// Called after live message indexing for dedup correctness and after batch operations.
+func (b *BleveClient) FlushEventID() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.flushEventIDBatchLocked()
 }

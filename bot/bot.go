@@ -101,6 +101,19 @@ func New(cfg *config.Config) (*Bot, error) {
 	batchIndexer.AddEventIDFn = func(eventID string) error {
 		return bleveClient.AddEventID(eventID)
 	}
+	// Flush callbacks for live messages — make documents immediately searchable
+	batchIndexer.FlushFn = func() error {
+		if err := bleveClient.Flush(); err != nil {
+			log.Printf("WARN bot: failed to flush document batch: %v", err)
+		}
+		return err
+	}
+	batchIndexer.FlushEventIDFn = func() error {
+		if err := bleveClient.FlushEventID(); err != nil {
+			log.Printf("WARN bot: failed to flush eventID batch: %v", err)
+		}
+		return err
+	}
 	batchIndexer.ProcessImageDescFn = func(images []indexer.PendingImage) ([]indexer.PendingImage, error) {
 		var failed []indexer.PendingImage
 		for i, img := range images {
@@ -706,7 +719,7 @@ func (b *Bot) handleEvent(ev *event.Event) {
 			Text:      text,
 		}
 
-		b.batchIndexer.OnTextMessageWithBuffering(msg)
+		b.batchIndexer.OnTextMessageWithBuffering(msg, true)
 		if b.batchIndexer.SendReceiptFn != nil {
 			b.batchIndexer.SendReceiptFn(ev.RoomID.String(), ev.ID.String())
 		}
@@ -1083,6 +1096,11 @@ func (b *Bot) ScanRoomHistory(roomID string, cutoffUnix int64) {
 
 	log.Printf("INFO bot: starting history scan for room %s (cutoff: %d)", roomID, cutoffUnix)
 
+	// Flush pending event IDs so dedup checks in this scan see them
+	if b.batchIndexer.FlushEventIDFn != nil {
+		_ = b.batchIndexer.FlushEventIDFn()
+	}
+
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		resp, err := b.client.Messages(ctx, id.RoomID(roomID), from, "", mautrix.Direction('b'), nil, 100)
@@ -1147,7 +1165,7 @@ func (b *Bot) ScanRoomHistory(roomID string, cutoffUnix int64) {
 					EventType: "m.room.message",
 					Text:      text,
 				}
-				indexed := b.batchIndexer.OnTextMessageWithBuffering(msg)
+				indexed := b.batchIndexer.OnTextMessageWithBuffering(msg, false)
 				textsIndexed += indexed
 				if indexed > 0 {
 					hasNewEvents = true
@@ -1197,6 +1215,11 @@ func (b *Bot) ScanRoomHistory(roomID string, cutoffUnix int64) {
 
 	flushed := b.batchIndexer.FlushBufferedMessages()
 	textsIndexed += flushed
+
+	// Flush document batch after history scan to persist all indexed documents
+	if b.batchIndexer.FlushFn != nil {
+		_ = b.batchIndexer.FlushFn()
+	}
 
 	log.Printf("INFO bot: scanned room %s: %d texts indexed, %d images deferred, %d pages scanned", roomID, textsIndexed, imagesDeferred, pagesScanned)
 }
