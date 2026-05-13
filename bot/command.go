@@ -121,13 +121,16 @@ func ParseCommandArgs(args string) (*CommandArgs, error) {
 	return ca, nil
 }
 
-func (h *CommandHandler) HandleSearch(args string, roomID string, userFilter string) (string, string, error) {
+func (h *CommandHandler) HandleSearch(args string, roomID string, userFilter string, lastUsedRoom string) (string, string, error) {
 	ca, err := ParseCommandArgs(args)
 	if err != nil {
 		return "Usage: !search <query> #room:server.org", "", nil
 	}
 
 	// Room filter is REQUIRED for search
+	if roomID == "" {
+		roomID = lastUsedRoom
+	}
 	if roomID == "" {
 		return "Error: You must specify a room to search. Use a room alias like #room:server.org", "", nil
 	}
@@ -146,13 +149,16 @@ func (h *CommandHandler) HandleSearch(args string, roomID string, userFilter str
 	return textResult, htmlResult, nil
 }
 
-func (h *CommandHandler) HandleSemanticSearch(args string, roomID string, userFilter string) (string, string, error) {
+func (h *CommandHandler) HandleSemanticSearch(args string, roomID string, userFilter string, lastUsedRoom string) (string, string, error) {
 	ca, err := ParseCommandArgs(args)
 	if err != nil {
 		return "Usage: !semantic <query> #room:server.org", "", nil
 	}
 
 	// Room filter is REQUIRED for semantic search
+	if roomID == "" {
+		roomID = lastUsedRoom
+	}
 	if roomID == "" {
 		return "Error: You must specify a room to search. Use a room alias like #room:server.org", "", nil
 	}

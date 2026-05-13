@@ -672,14 +672,28 @@ func (b *Bot) handleEvent(ev *event.Event) {
 
 				switch cmd {
 				case "search":
-					textResult, htmlResult, err := b.commandHandler.HandleSearch(args, searchRoomID, searchUser)
+					lastUsedRoom := b.batchIndexer.GetLastUsedRoom(ev.RoomID.String())
+					textResult, htmlResult, err := b.commandHandler.HandleSearch(args, searchRoomID, searchUser, lastUsedRoom)
+					if err == nil {
+						if searchRoomID == "" {
+							searchRoomID = lastUsedRoom
+						}
+						b.batchIndexer.SetLastUsedRoom(ev.RoomID.String(), searchRoomID)
+					}
 					if err != nil {
 						textResult = fmt.Sprintf("Error: %v", err)
 						htmlResult = textResult
 					}
 					b.sendReplyHTML(ev.RoomID, ev.ID, textResult, htmlResult)
 				case "search-semantic":
-					textResult, htmlResult, err := b.commandHandler.HandleSemanticSearch(args, searchRoomID, searchUser)
+					lastUsedRoom := b.batchIndexer.GetLastUsedRoom(ev.RoomID.String())
+					textResult, htmlResult, err := b.commandHandler.HandleSemanticSearch(args, searchRoomID, searchUser, lastUsedRoom)
+					if err == nil {
+						if searchRoomID == "" {
+							searchRoomID = lastUsedRoom
+						}
+						b.batchIndexer.SetLastUsedRoom(ev.RoomID.String(), searchRoomID)
+					}
 					if err != nil {
 						textResult = fmt.Sprintf("Error: %v", err)
 						htmlResult = textResult

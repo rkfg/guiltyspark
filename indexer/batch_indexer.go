@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"maps"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -35,10 +36,12 @@ type BatchIndexer struct {
 	deferredImages []PendingImage
 	// deferredTextEmbed are text messages whose embedding is deferred
 	deferredTextEmbed []PendingMessage
-	mu                sync.Mutex
-	saveMu            sync.Mutex
-	stopCh            chan struct{}
-	wg                sync.WaitGroup
+	// lastUsedRooms tracks the last searched room per DM room
+	lastUsedRooms map[string]string
+	mu            sync.Mutex
+	saveMu        sync.Mutex
+	stopCh        chan struct{}
+	wg            sync.WaitGroup
 
 	// Callbacks
 	IndexTextFn  func(doc IndexedDocument) error
@@ -103,6 +106,7 @@ func NewBatchIndexer(embedHour, embedMinute int, persistDir string) *BatchIndexe
 type persistData struct {
 	DeferredImages    []PendingImage   `json:"deferred_images"`
 	DeferredTextEmbed []PendingMessage `json:"deferred_text"`
+	LastUsedRooms     map[string]string `json:"last_used_rooms,omitempty"`
 }
 
 func (b *BatchIndexer) saveDeferred() {
@@ -115,6 +119,10 @@ func (b *BatchIndexer) saveDeferred() {
 	}
 	copy(data.DeferredImages, b.deferredImages)
 	copy(data.DeferredTextEmbed, b.deferredTextEmbed)
+	if len(b.lastUsedRooms) > 0 {
+		data.LastUsedRooms = make(map[string]string, len(b.lastUsedRooms))
+		maps.Copy(data.LastUsedRooms, b.lastUsedRooms)
+	}
 	b.mu.Unlock()
 
 	jsonData, err := json.Marshal(data)
@@ -154,9 +162,38 @@ func (b *BatchIndexer) loadDeferred() {
 	b.mu.Lock()
 	b.deferredImages = append(b.deferredImages, data.DeferredImages...)
 	b.deferredTextEmbed = append(b.deferredTextEmbed, data.DeferredTextEmbed...)
+	if len(data.LastUsedRooms) > 0 {
+		b.lastUsedRooms = data.LastUsedRooms
+	}
 	b.mu.Unlock()
 
 	log.Printf("INFO batch_indexer: loaded %d deferred images, %d deferred text embeddings", len(data.DeferredImages), len(data.DeferredTextEmbed))
+}
+
+// GetLastUsedRoom returns the last room used for search in the given DM room.
+func (b *BatchIndexer) GetLastUsedRoom(dmRoomID string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.lastUsedRooms == nil {
+		return ""
+	}
+	return b.lastUsedRooms[dmRoomID]
+}
+
+// SetLastUsedRoom records the last room used for search in the given DM room.
+// Only writes to disk if the value actually changed.
+func (b *BatchIndexer) SetLastUsedRoom(dmRoomID, roomID string) {
+	b.mu.Lock()
+	if b.lastUsedRooms == nil {
+		b.lastUsedRooms = make(map[string]string)
+	}
+	if b.lastUsedRooms[dmRoomID] == roomID {
+		b.mu.Unlock()
+		return
+	}
+	b.lastUsedRooms[dmRoomID] = roomID
+	b.mu.Unlock()
+	b.saveDeferred()
 }
 
 // OnTextMessageWithBuffering accumulates consecutive messages from the same user in the same room.
