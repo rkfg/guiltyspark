@@ -185,51 +185,6 @@ func formatResult(r Result, idx int) (string, string) {
 	return textLine.String(), htmlLine.String()
 }
 
-func (e *Engine) Search(queryText string, roomFilter, userFilter string) (*SearchResult, error) {
-	filteredQuery, vector := e.prepareQuery(queryText)
-	if filteredQuery == "" {
-		return &SearchResult{Query: queryText}, nil
-	}
-
-	result := &SearchResult{Query: queryText}
-	result.QueryVector = vector
-
-	// Exact search
-	exactResults, err := e.bleveClient.SearchExact(filteredQuery, roomFilter)
-	if err != nil {
-		return nil, fmt.Errorf("exact search: %w", err)
-	}
-
-	result.Exact = filterHitsByUserAndRoom(exactResults.Hits, "", userFilter)
-	result.Exact = limitResults(result.Exact, e.cfg.ResultLimit)
-
-	// Semantic search using Bleve native kNN with FAISS backend
-	semanticResults, err := e.bleveClient.SearchSemantic(vector, roomFilter)
-	if err != nil {
-		return nil, fmt.Errorf("semantic search: %w", err)
-	}
-
-	result.Semantic = filterHitsByUserAndRoom(semanticResults.Hits, roomFilter, userFilter)
-	result.Semantic = limitResults(result.Semantic, e.cfg.ResultLimit)
-	log.Printf("INFO search: semantic results=%d (limit=%d)", len(result.Semantic), e.cfg.ResultLimit)
-
-	// Deduplicate semantic results against exact results
-	seen := make(map[string]bool)
-	for _, r := range result.Exact {
-		seen[r.EventID] = true
-	}
-
-	uniqueSemantic := result.Semantic[:0]
-	for _, r := range result.Semantic {
-		if !seen[r.EventID] {
-			uniqueSemantic = append(uniqueSemantic, r)
-		}
-	}
-	result.Semantic = uniqueSemantic
-
-	return result, nil
-}
-
 // SemanticSearch performs only semantic (vector) search without exact text search.
 func (e *Engine) SemanticSearch(queryText string, roomFilter, userFilter string) (*SearchResult, error) {
 	filteredQuery, vector := e.prepareQuery(queryText)
