@@ -19,6 +19,7 @@ import (
 type Client struct {
 	httpClient     *http.Client
 	baseURL        string
+	chatBaseURL    string
 	apiKey         string
 	model          string
 	imageModel     string
@@ -30,8 +31,16 @@ type Client struct {
 
 func NewClient(cfg *config.LLMConfig, retryCfg retry.BackoffConfig, timeout time.Duration) *Client {
 	return &Client{
-		httpClient:     &http.Client{Timeout: timeout},
-		baseURL:        cfg.BaseURL,
+		httpClient: &http.Client{
+			Timeout: timeout,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 20,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		},
+		baseURL:        cfg.EmbeddingBaseURL,
+		chatBaseURL:    cfg.BaseURL,
 		apiKey:         cfg.APIKey,
 		model:          cfg.EmbeddingModel,
 		imageModel:     cfg.ImageModel,
@@ -47,7 +56,7 @@ type embeddingResponse struct {
 	} `json:"data"`
 }
 
-func (c *Client) CreateEmbedding(text string) ([]float32, error) {
+func (c *Client) CreateEmbedding(text, prefix string) ([]float32, error) {
 	var result embeddingResponse
 	var lastErr error
 
@@ -58,7 +67,7 @@ func (c *Client) CreateEmbedding(text string) ([]float32, error) {
 			time.Sleep(delay)
 		}
 
-		result, lastErr = c.doEmbedding(text)
+		result, lastErr = c.doEmbedding(text, prefix)
 		if lastErr == nil {
 			return result.Data[0].Embedding, nil
 		}
@@ -68,8 +77,12 @@ func (c *Client) CreateEmbedding(text string) ([]float32, error) {
 	return nil, fmt.Errorf("embedding failed after retries: %w", lastErr)
 }
 
-func (c *Client) doEmbedding(text string) (embeddingResponse, error) {
+func (c *Client) doEmbedding(text, prefix string) (embeddingResponse, error) {
 	var result embeddingResponse
+
+	if prefix != "" {
+		text = prefix + text
+	}
 
 	payload := map[string]any{
 		"model": c.model,
@@ -196,7 +209,7 @@ func (c *Client) doDescribeImage(base64Data string, mimeType string) error {
 		return fmt.Errorf("marshal image request: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", c.baseURL+"/chat/completions", bytes.NewReader(body))
+	req, err := http.NewRequest("POST", c.chatBaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create image request: %w", err)
 	}

@@ -35,12 +35,13 @@ type IndexingConfig struct {
 }
 
 type LLMConfig struct {
-	BaseURL        string `yaml:"base_url"`
-	APIKey         string `yaml:"api_key"`
-	EmbeddingModel string `yaml:"embedding_model"`
-	ImageModel     string `yaml:"image_model"`
-	ImagePrompt    string `yaml:"image_prompt"`
-	Timeout        time.Duration `yaml:"timeout"`
+	BaseURL          string `yaml:"base_url"`
+	EmbeddingBaseURL string `yaml:"embedding_base_url"`
+	APIKey           string `yaml:"api_key"`
+	EmbeddingModel   string `yaml:"embedding_model"`
+	ImageModel       string `yaml:"image_model"`
+	ImagePrompt      string `yaml:"image_prompt"`
+	Timeout          time.Duration `yaml:"timeout"`
 }
 
 type SearchConfig struct {
@@ -95,6 +96,19 @@ func (c *Config) GetRoomConfig(roomID string) *RoomConfig {
 }
 
 func Load(path string) (*Config, error) {
+	return LoadForMode(path, ModeBot)
+}
+
+func LoadForReembed(path string) (*Config, error) {
+	return LoadForMode(path, ModeReembed)
+}
+
+const (
+	ModeBot      = "bot"
+	ModeReembed  = "reembed"
+)
+
+func LoadForMode(path, mode string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config file: %w", err)
@@ -105,28 +119,33 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
-	if err := cfg.Validate(); err != nil {
+	if err := cfg.Validate(mode); err != nil {
 		return nil, err
 	}
 
 	return &cfg, nil
 }
 
-func (c *Config) Validate() error {
-	if c.Bot.Homeserver == "" {
-		return fmt.Errorf("bot.homeserver is required")
-	}
+func (c *Config) Validate(mode string) error {
+	if mode == ModeBot {
+		if c.Bot.Homeserver == "" {
+			return fmt.Errorf("bot.homeserver is required")
+		}
 	if c.Indexing.StartupGracePeriod == 0 {
 		c.Indexing.StartupGracePeriod = 10 * time.Second
 	}
-	if c.Bot.UserID == "" {
-		return fmt.Errorf("bot.user_id is required")
+		if c.Bot.UserID == "" {
+			return fmt.Errorf("bot.user_id is required")
+		}
+		if c.Bot.AccessToken == "" {
+			return fmt.Errorf("bot.access_token is required")
+		}
 	}
-	if c.Bot.AccessToken == "" {
-		return fmt.Errorf("bot.access_token is required")
+	if c.LLM.BaseURL == "" && c.LLM.EmbeddingBaseURL == "" {
+		return fmt.Errorf("llm.base_url or llm.embedding_base_url is required")
 	}
-	if c.LLM.BaseURL == "" {
-		return fmt.Errorf("llm.base_url is required")
+	if c.LLM.EmbeddingBaseURL == "" {
+		c.LLM.EmbeddingBaseURL = c.LLM.BaseURL
 	}
 	if c.LLM.EmbeddingModel == "" {
 		return fmt.Errorf("llm.embedding_model is required")
@@ -138,7 +157,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("llm.image_prompt is required")
 	}
 	if c.Search.VectorDimensions == 0 {
-		c.Search.VectorDimensions = 1536
+		c.Search.VectorDimensions = 768
 	}
 	if c.Search.Analyzer == "" {
 		c.Search.Analyzer = "ru"

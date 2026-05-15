@@ -33,8 +33,10 @@ type SearchResult struct {
 	QueryVector []float32
 }
 
+const searchQueryPrefix = "search_query: "
+
 type EmbedClient interface {
-	CreateEmbedding(text string) ([]float32, error)
+	CreateEmbedding(text, prefix string) ([]float32, error)
 }
 type Engine struct {
 	bleveClient *indexer.BleveClient
@@ -128,7 +130,7 @@ func (e *Engine) prepareQuery(queryText string) (string, []float32) {
 	if filteredQuery == "" {
 		return "", nil
 	}
-	vector, err := e.embedClient.CreateEmbedding(filteredQuery)
+	vector, err := e.embedClient.CreateEmbedding(filteredQuery, searchQueryPrefix)
 	if err != nil {
 		panic(fmt.Errorf("create query embedding: %w", err))
 	}

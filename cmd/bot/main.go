@@ -14,8 +14,29 @@ import (
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "Path to configuration file")
+	doReembed := flag.Bool("reembed", false, "Re-embed all documents in the index (no Matrix client)")
+	reembedIndex := flag.String("reembed.index", "", "Bleve index path (default: <storage_path>/index.bleve)")
 	flag.Parse()
 	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+
+	if *doReembed {
+		cfg, err := config.LoadForReembed(*configPath)
+		if err != nil {
+			log.Fatalf("Failed to load config: %v", err)
+		}
+
+		indexPath := cfg.StoragePath + "/index.bleve"
+		if *reembedIndex != "" {
+			indexPath = *reembedIndex
+		}
+
+		err = reembed(indexPath, cfg)
+		if err != nil {
+			log.Fatalf("Reembed failed: %v", err)
+		}
+		fmt.Println("Reembed completed.")
+		return
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {

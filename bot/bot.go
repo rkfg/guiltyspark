@@ -1,20 +1,22 @@
 package bot
 
 import (
-	"slices"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
-
-	"github.com/rs/zerolog"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog"
 	"go.mau.fi/util/dbutil"
 	_ "go.mau.fi/util/dbutil/litestream"
 	"maunium.net/go/mautrix"
@@ -43,6 +45,55 @@ type Bot struct {
 	joinedInviteRooms map[string]bool
 	inviteMu          sync.Mutex
 	cryptoHelper      *cryptohelper.CryptoHelper
+}
+
+func isRateLimitErr(err error) (*mautrix.HTTPError, bool) {
+	if err == nil {
+		return nil, false
+	}
+	var httpErr mautrix.HTTPError
+	if errors.As(err, &httpErr) && httpErr.RespError != nil && httpErr.RespError.ErrCode == "M_LIMIT_EXCEEDED" {
+		return &httpErr, true
+	}
+	return nil, false
+}
+
+func withRateLimitRetry(ctx context.Context, label string, fn func(context.Context) error, maxRetries int) error {
+	for attempt := range maxRetries {
+		err := fn(ctx)
+		if err == nil {
+			return nil
+		}
+		httpErr, is429 := isRateLimitErr(err)
+		if !is429 {
+			return err
+		}
+		var delay time.Duration
+		if retryAfter := httpErr.Response.Header.Get("Retry-After"); retryAfter != "" {
+			if parsed, err := time.Parse(http.TimeFormat, retryAfter); err == nil {
+				delay = time.Until(parsed)
+			} else if seconds, err := strconv.Atoi(retryAfter); err == nil {
+				delay = time.Duration(seconds) * time.Second
+			} else if d, err := time.ParseDuration(retryAfter); err == nil {
+				delay = d
+			} else {
+				delay = time.Second
+			}
+		} else {
+			delay = time.Duration(float64(2*time.Second) * math.Pow(2.0, float64(attempt)))
+		}
+		if delay < time.Second {
+			delay = time.Second
+		}
+		log.Printf("WARN %s: rate limited (%s), retrying in %v (attempt %d/%d)", label, err, delay, attempt+1, maxRetries)
+		time.Sleep(delay)
+	}
+	// Final attempt after all retries exhausted
+	err := fn(ctx)
+	if err == nil {
+		return nil
+	}
+	return err
 }
 
 func New(cfg *config.Config) (*Bot, error) {
@@ -135,7 +186,7 @@ func New(cfg *config.Config) (*Bot, error) {
 				continue
 			}
 
-			vector, err := embedClient.CreateEmbedding(img.Description)
+			vector, err := embedClient.CreateEmbedding(img.Description, "search_document: ")
 			if err != nil {
 				log.Printf("Failed to embed deferred image %s: %v", img.EventID, err)
 				failed = append(failed, img)
@@ -170,7 +221,7 @@ func New(cfg *config.Config) (*Bot, error) {
 	batchIndexer.ProcessDeferredTextFn = func(texts []indexer.PendingMessage) ([]indexer.PendingMessage, error) {
 		var failed []indexer.PendingMessage
 		for _, msg := range texts {
-			vector, err := embedClient.CreateEmbedding(msg.Text)
+			vector, err := embedClient.CreateEmbedding(msg.Text, "search_document: ")
 			if err != nil {
 				log.Printf("Failed to embed deferred text %s: %v", msg.EventID, err)
 				failed = append(failed, msg)
@@ -321,21 +372,12 @@ func (b *Bot) Start() error {
 
 	// Initialize E2EE crypto helper — this sets up decryption for m.room.encrypted events
 	// and registers its own handlers for ProcessSyncResponse, HandleMemberEvent, HandleEncrypted
+	// cryptohelper.Init() handles device ID resolution internally via crypto store,
+	// so no separate Whoami() call needed here (saves 1 API call per restart)
 	ctx := context.Background()
 
-	// Resolve device ID from access token before Init() — cryptohelper.Init() checks
-	// client.DeviceID != "" at line 201 and returns error before creating mach (line 204)
-	// if device ID is empty. Whoami() populates it from the access token.
-	if b.client.DeviceID == "" {
-		whoamiResp, err := b.client.Whoami(ctx)
-		if err != nil {
-			log.Printf("WARNING: Whoami failed: %v, continuing without device ID resolution", err)
-		} else {
-			b.client.DeviceID = whoamiResp.DeviceID
-		}
-	}
-
-	initErr := b.cryptoHelper.Init(ctx)
+	e2eeMaxRetries := 5
+	initErr := withRateLimitRetry(ctx, "E2EE init", b.cryptoHelper.Init, e2eeMaxRetries)
 
 	// When login_password is set, cryptohelper logs in via StoreCredentials
 	// which sets client.AccessToken = resp.AccessToken on the client.

@@ -26,6 +26,7 @@ indexing:
 
 llm:
   base_url: "https://your-llm-server.example.com/v1"
+  # embedding_base_url: "https://embedding-server.example.com/v1"
   api_key: "YOUR_LLM_API_KEY"
   embedding_model: "Qwen3 Embedding 8B"
   image_model: "Qwopus 3.5 4B [VLM]"
