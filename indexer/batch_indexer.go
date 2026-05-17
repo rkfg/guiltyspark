@@ -61,7 +61,6 @@ type BatchIndexer struct {
 	imageCh chan PendingImage
 
 	// Callbacks
-	SendReceiptFn func(roomID, eventID string)
 
 	// Deferred processing scheduler
 	embedHour   int
