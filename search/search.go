@@ -194,7 +194,7 @@ func (e *Engine) SemanticSearch(queryText string, roomFilter, userFilter string)
 		return &SearchResult{Query: queryText}, nil
 	}
 
-	result := &SearchResult{Query: queryText}
+	result := &SearchResult{Query: filteredQuery}
 	result.QueryVector = vector
 
 	// Semantic search using Bleve native kNN with FAISS backend
@@ -216,7 +216,7 @@ func (e *Engine) ExactSearch(queryText string, roomFilter, userFilter string) (*
 		return &SearchResult{Query: queryText}, nil
 	}
 
-	result := &SearchResult{Query: queryText}
+	result := &SearchResult{Query: filteredQuery}
 
 	// Exact search
 	exactResults, err := e.bleveClient.SearchExact(filteredQuery, roomFilter)
