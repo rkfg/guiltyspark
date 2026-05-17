@@ -75,6 +75,7 @@ go build -tags vectors -o bot-bin ./cmd/bot/ && go vet -tags vectors ./...
 - Grace period: сообщения до `startTime - gracePeriod` игнорируются
 - Команды не индексируются
 - `sync.Mutex` для данных (`mu`) и `sync.Mutex` для save операций (`saveMu`) — раздельные мьютексы для избежания dead-lock
+- **Мьютексы следует избегать** — вместо shared state и блокировок использовать каналы (CSP pattern — Communicating Sequential Processes). Предпочитать goroutine с channel вместо sync.Mutex/sync.RWMutex.
 - Persistence: `deferred.json` сохраняется при каждом сообщении и очищается после обработки
 - Link preview: для сообщений с URL запрашивается превью через API Matrix `GET /_matrix/media/v3/preview_url` (Synapse). Превью добавляются к тексту сообщения как `preview: [title] - description`. Неудавшиеся запросы игнорируются.
 - Команды работают только в DM — это обеспечивает приватность результатов поиска
