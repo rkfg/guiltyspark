@@ -12,10 +12,36 @@ import (
 	index "github.com/blevesearch/bleve_index_api"
 )
 
+type bleveTaskType int
+
+const (
+	taskIndexDoc bleveTaskType = iota
+	taskAddEventID
+	taskFlush
+	taskFlushEventID
+	taskIsEventIDExists
+	taskCountDocuments
+	taskClose
+	taskExecBatch
+)
+
+type bleveTask struct {
+	Type    bleveTaskType
+	Doc     IndexedDocument
+	EventID string
+	Batch   *bleve.Batch
+	RespCh  chan bleveTaskResponse
+}
+
+type bleveTaskResponse struct {
+	Exists bool
+	Count  int
+	Err    error
+}
+
 type BleveClient struct {
 	index        bleve.Index
 	eventIDIndex bleve.Index
-	mu           sync.Mutex
 
 	// batchBuf accumulates docs for batched indexing to reduce disk I/O.
 	batchBuf    []IndexedDocument
@@ -26,9 +52,13 @@ type BleveClient struct {
 	eventIDBufLen int
 
 	// processedEventIDs is a local cache of event IDs already added to the index.
-	// Used for O(1) dedup checks without hitting Bleve.
-	// Cleared after flushEventIDBatchLocked to allow Bleve to be the source of truth.
+	// Cleared after flushEventIDBatch to allow Bleve to be the source of truth.
 	processedEventIDs map[string]bool
+
+	// CSP: воркер — единственный, кто модифицирует local state
+	taskCh  chan bleveTask
+	stopCh  chan struct{}
+	wg      sync.WaitGroup
 }
 
 func NewBleveClient(indexPath string, vectorDims int, analyzer string) (*BleveClient, error) {
@@ -87,18 +117,24 @@ func NewBleveClient(indexPath string, vectorDims int, analyzer string) (*BleveCl
 		log.Printf("INFO bleve: Opened existing processedEvents index at %s.eventid", indexPath)
 	}
 
-	return &BleveClient{index: index, eventIDIndex: eventIDIndex, processedEventIDs: make(map[string]bool)}, nil
+	b := &BleveClient{
+		index:             index,
+		eventIDIndex:      eventIDIndex,
+		processedEventIDs: make(map[string]bool),
+
+		// CSP: воркер — единственный, кто модифицирует local state
+		taskCh:  make(chan bleveTask, 1000),
+		stopCh:  make(chan struct{}),
+	}
+
+	b.wg.Add(1)
+	go b.bleveWorker()
+	return b, nil
 }
 
 func (b *BleveClient) Close() error {
-	b.mu.Lock()
-	if err := b.flushBatchLocked(); err != nil {
-		log.Printf("ERROR bleve: failed to flush batch on close: %v", err)
-	}
-	if err := b.flushEventIDBatchLocked(); err != nil {
-		log.Printf("ERROR bleve: failed to flush eventID batch on close: %v", err)
-	}
-	b.mu.Unlock()
+	close(b.stopCh)
+	b.wg.Wait()
 	err := b.index.Close()
 	if err2 := b.eventIDIndex.Close(); err2 != nil && err == nil {
 		err = err2
@@ -106,11 +142,9 @@ func (b *BleveClient) Close() error {
 	return err
 }
 
-// IndexDocumentStruct uses struct-based indexing which preserves []float32 type.
-// Accumulates documents in a buffer and flushes in batches of 100 to reduce
-// disk I/O (segment creation + bolt sync) during bulk indexing.
-// flushBatchLocked must be called with b.mu held.
-func (b *BleveClient) flushBatchLocked() error {
+// flushBatch persists pending documents in the batch buffer to the Bleve index.
+// Called only by the worker goroutine — no mutex needed.
+func (b *BleveClient) flushBatch() error {
 	if b.batchBufLen == 0 {
 		return nil
 	}
@@ -126,15 +160,9 @@ func (b *BleveClient) flushBatchLocked() error {
 	return b.index.Batch(batch)
 }
 
-// IndexDocumentStruct uses struct-based indexing which preserves []float32 type.
-// Accumulates documents in a buffer and flushes in batches of 100 to reduce
-// disk I/O (segment creation + bolt sync) during bulk indexing.
-//
-// CRITICAL: b.index.Batch(batch) is called OUTSIDE b.mu to avoid deadlocking.
-// If b.index.Batch() blocks on bolt write locks (scorch persister), holding b.mu
-// would prevent all concurrent IndexDocumentStruct calls.
-func (b *BleveClient) IndexDocumentStruct(doc IndexedDocument) error {
-	b.mu.Lock()
+// addDocToBatch accumulates a document in batchBuf, flushing when the batch is full.
+// Called only by the worker goroutine — no mutex needed.
+func (b *BleveClient) addDocToBatch(doc IndexedDocument) error {
 	b.batchBufLen++
 	if b.batchBufLen > cap(b.batchBuf) {
 		newBuf := make([]IndexedDocument, len(b.batchBuf)+100)
@@ -144,29 +172,20 @@ func (b *BleveClient) IndexDocumentStruct(doc IndexedDocument) error {
 	b.batchBuf[b.batchBufLen-1] = doc
 
 	const batchSize = 100
-	var flushErr error
-	var batchDocs []IndexedDocument
 	if b.batchBufLen >= batchSize {
-		// Snapshot batch contents and reset buffer while holding the lock
-		batchDocs = make([]IndexedDocument, b.batchBufLen)
-		copy(batchDocs, b.batchBuf)
-		b.batchBufLen = 0
+		return b.flushBatch()
 	}
-	b.mu.Unlock()
+	return nil
+}
 
-	// Execute batch WITHOUT holding b.mu
-	// This prevents deadlock when b.index.Batch() blocks on bolt locks
-	if len(batchDocs) > 0 {
-		batch := b.index.NewBatch()
-		for i := 0; i < len(batchDocs); i++ {
-			if err := batch.Index(batchDocs[i].ID, batchDocs[i]); err != nil {
-				log.Printf("ERROR bleve: batch index error docID=%s ERROR=%v", batchDocs[i].ID, err)
-			}
-		}
-		flushErr = b.index.Batch(batch)
-	}
-
-	return flushErr
+// IndexDocumentStruct uses struct-based indexing which preserves []float32 type.
+// Accumulates documents in a buffer and flushes in batches of 100 to reduce
+// disk I/O (segment creation + bolt sync) during bulk indexing.
+func (b *BleveClient) IndexDocumentStruct(doc IndexedDocument) error {
+	respCh := make(chan bleveTaskResponse, 1)
+	b.taskCh <- bleveTask{Type: taskIndexDoc, Doc: doc, RespCh: respCh}
+	resp := <-respCh
+	return resp.Err
 }
 
 func (b *BleveClient) SearchExact(queryText string, roomID string) (*bleve.SearchResult, error) {
@@ -217,11 +236,9 @@ func (b *BleveClient) SearchSemantic(queryVector []float32, roomID string) (*ble
 	return result, nil
 }
 
-// AddEventID stores an event ID in the processedEvents index for deduplication.
-// Buffers event IDs and flushes in batches to reduce disk I/O.
-// Also adds to local cache for O(1) dedup checks.
-func (b *BleveClient) AddEventID(eventID string) error {
-	b.mu.Lock()
+// addEventIDToBuffer accumulates an event ID in eventIDBuf, flushing when the batch is full.
+// Called only by the worker goroutine — no mutex needed.
+func (b *BleveClient) addEventIDToBuffer(eventID string) error {
 	b.processedEventIDs[eventID] = true
 	b.eventIDBufLen++
 	if b.eventIDBufLen > cap(b.eventIDBuf) {
@@ -232,15 +249,23 @@ func (b *BleveClient) AddEventID(eventID string) error {
 	b.eventIDBuf[b.eventIDBufLen-1] = eventID
 
 	const eventIDBatchSize = 50
-	var flushErr error
 	if b.eventIDBufLen >= eventIDBatchSize {
-		flushErr = b.flushEventIDBatchLocked()
+		return b.flushEventIDBatch()
 	}
-	b.mu.Unlock()
-	return flushErr
+	return nil
 }
 
-func (b *BleveClient) flushEventIDBatchLocked() error {
+// AddEventID stores an event ID in the processedEvents index for deduplication.
+// Buffers event IDs and flushes in batches to reduce disk I/O.
+// Also adds to local cache for O(1) dedup checks.
+func (b *BleveClient) AddEventID(eventID string) error {
+	respCh := make(chan bleveTaskResponse, 1)
+	b.taskCh <- bleveTask{Type: taskAddEventID, EventID: eventID, RespCh: respCh}
+	resp := <-respCh
+	return resp.Err
+}
+
+func (b *BleveClient) flushEventIDBatch() error {
 	if b.eventIDBufLen == 0 {
 		return nil
 	}
@@ -255,9 +280,10 @@ func (b *BleveClient) flushEventIDBatchLocked() error {
 	return b.eventIDIndex.Batch(batch)
 }
 
-// IsEventIDExists checks if an event ID exists in the processedEvents index.
+// isEventIDExists checks if an event ID exists in the processedEvents index.
+// Called only by the worker goroutine — no mutex needed.
 // Checks local cache first (O(1)), falls back to Bleve query.
-func (b *BleveClient) IsEventIDExists(eventID string) (bool, error) {
+func (b *BleveClient) isEventIDExists(eventID string) (bool, error) {
 	if b.processedEventIDs[eventID] {
 		return true, nil
 	}
@@ -272,17 +298,32 @@ func (b *BleveClient) IsEventIDExists(eventID string) (bool, error) {
 	return result.Total > 0, nil
 }
 
-func (b *BleveClient) CountDocuments() (int, error) {
-	countReq := bleve.NewMatchAllQuery()
+// IsEventIDExists checks if an event ID exists in the processedEvents index.
+// Checks local cache first (O(1)), falls back to Bleve query.
+func (b *BleveClient) IsEventIDExists(eventID string) (bool, error) {
+	respCh := make(chan bleveTaskResponse, 1)
+	b.taskCh <- bleveTask{Type: taskIsEventIDExists, EventID: eventID, RespCh: respCh}
+	resp := <-respCh
+	return resp.Exists, resp.Err
+}
 
+func (b *BleveClient) CountDocuments() (int, error) {
+	respCh := make(chan bleveTaskResponse, 1)
+	b.taskCh <- bleveTask{Type: taskCountDocuments, RespCh: respCh}
+	resp := <-respCh
+	return resp.Count, resp.Err
+}
+
+// countDocuments returns the document count using the Bleve index.
+// Called only by the worker goroutine — no mutex needed.
+func (b *BleveClient) countDocuments() (int, error) {
+	countReq := bleve.NewMatchAllQuery()
 	countReq2 := bleve.NewSearchRequest(countReq)
 	countReq2.Size = 0
-
 	result, err := b.index.Search(countReq2)
 	if err != nil {
 		return 0, err
 	}
-
 	return int(result.Total), nil
 }
 
@@ -294,8 +335,72 @@ func (b *BleveClient) BatchIndex(batch *bleve.Batch, doc IndexedDocument) error 
 	return batch.Index(doc.ID, doc)
 }
 
+// ExecBatch executes a batch through the worker for bulk indexing.
+// Used in reembed for bulk indexing of migrated documents.
 func (b *BleveClient) ExecBatch(batch *bleve.Batch) error {
-	return b.index.Batch(batch)
+	respCh := make(chan bleveTaskResponse, 1)
+	b.taskCh <- bleveTask{Type: taskExecBatch, Batch: batch, RespCh: respCh}
+	resp := <-respCh
+	return resp.Err
+}
+
+// bleveWorker is the single goroutine that processes all tasks.
+// Since it's the only goroutine, no mutexes are needed for local state.
+func (b *BleveClient) bleveWorker() {
+	defer b.wg.Done()
+	for {
+		select {
+		case task := <-b.taskCh:
+			switch task.Type {
+			case taskIndexDoc:
+				if err := b.addDocToBatch(task.Doc); err != nil {
+					task.RespCh <- bleveTaskResponse{Err: err}
+				} else {
+					task.RespCh <- bleveTaskResponse{}
+				}
+			case taskAddEventID:
+				if err := b.addEventIDToBuffer(task.EventID); err != nil {
+					task.RespCh <- bleveTaskResponse{Err: err}
+				} else {
+					task.RespCh <- bleveTaskResponse{}
+				}
+			case taskFlush:
+				if err := b.flushBatch(); err != nil {
+					task.RespCh <- bleveTaskResponse{Err: err}
+				} else {
+					task.RespCh <- bleveTaskResponse{}
+				}
+			case taskFlushEventID:
+				if err := b.flushEventIDBatch(); err != nil {
+					task.RespCh <- bleveTaskResponse{Err: err}
+				} else {
+					task.RespCh <- bleveTaskResponse{}
+				}
+			case taskIsEventIDExists:
+				exists, err := b.isEventIDExists(task.EventID)
+				task.RespCh <- bleveTaskResponse{Exists: exists, Err: err}
+			case taskCountDocuments:
+				count, err := b.countDocuments()
+				task.RespCh <- bleveTaskResponse{Count: count, Err: err}
+			case taskExecBatch:
+				if task.Batch != nil {
+					if err := b.index.Batch(task.Batch); err != nil {
+						task.RespCh <- bleveTaskResponse{Err: err}
+					}
+				}
+				task.RespCh <- bleveTaskResponse{}
+			case taskClose:
+				b.flushBatch()
+				b.flushEventIDBatch()
+				task.RespCh <- bleveTaskResponse{}
+			}
+		case <-b.stopCh:
+			b.flushBatch()
+			b.flushEventIDBatch()
+			close(b.taskCh)
+			return
+		}
+	}
 }
 
 // ScanAllDocuments iterates over all documents in the index, calling fn for each.
@@ -468,17 +573,17 @@ func (b *BleveClient) ScanIndex(srcIdx bleve.Index, fn func(doc IndexedDocument)
 }
 
 // Flush persists any pending documents in the batch buffer to the Bleve index.
-// Called after live message indexing to make documents immediately searchable.
 func (b *BleveClient) Flush() error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.flushBatchLocked()
+	respCh := make(chan bleveTaskResponse, 1)
+	b.taskCh <- bleveTask{Type: taskFlush, RespCh: respCh}
+	<-respCh
+	return nil
 }
 
 // FlushEventID persists any pending event IDs in the batch buffer to the eventID index.
-// Called after live message indexing for dedup correctness and after batch operations.
 func (b *BleveClient) FlushEventID() error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.flushEventIDBatchLocked()
+	respCh := make(chan bleveTaskResponse, 1)
+	b.taskCh <- bleveTask{Type: taskFlushEventID, RespCh: respCh}
+	<-respCh
+	return nil
 }

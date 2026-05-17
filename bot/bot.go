@@ -13,7 +13,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -43,7 +42,6 @@ type Bot struct {
 	startTime         time.Time
 	gracePeriod       time.Duration
 	joinedInviteRooms map[string]bool
-	inviteMu          sync.Mutex
 	cryptoHelper      *cryptohelper.CryptoHelper
 }
 
@@ -115,12 +113,12 @@ func New(cfg *config.Config) (*Bot, error) {
 		return nil, fmt.Errorf("create bleve client: %w", err)
 	}
 
-	// Create batch indexer
-	batchIndexer := indexer.NewBatchIndexer(cfg.Indexing.DelayedEmbedHour, cfg.Indexing.DelayedEmbedMinute, cfg.StoragePath)
-
 	// Create image processor
 	imageProcessor := indexer.NewImageProcessor(&cfg.ImageProc, embedClient)
 	imageProcessor.SetHomeserver(cfg.Bot.Homeserver, cfg.Bot.AccessToken)
+
+	// Create batch indexer
+	batchIndexer := indexer.NewBatchIndexer(cfg.Indexing.DelayedEmbedHour, cfg.Indexing.DelayedEmbedMinute, cfg.StoragePath, bleveClient, embedClient, imageProcessor)
 
 	// Create search engine
 	searchEngine := search.NewEngine(bleveClient, embedClient, &cfg.Search)
@@ -130,126 +128,6 @@ func New(cfg *config.Config) (*Bot, error) {
 
 	// Store grace period for filtering old messages
 	gracePeriod := cfg.Indexing.StartupGracePeriod
-
-	// Set up batch indexer callbacks
-	batchIndexer.IndexTextFn = func(doc indexer.IndexedDocument) error {
-		// Index in Bleve for text search
-		// Use struct-based indexing to preserve []float32 type for vector field
-		// map[string]any would convert []float32 to []any{float64, ...}
-		if err := bleveClient.IndexDocumentStruct(doc); err != nil {
-			return err
-		}
-		// Mark event ID as processed immediately — prevents re-indexing on restart
-		// even if the event was appended to another document (reindex via buffering)
-		if err := bleveClient.AddEventID(doc.EventID); err != nil {
-			log.Printf("Failed to mark event ID %s as processed: %v", doc.EventID, err)
-		}
-		return nil
-	}
-	batchIndexer.IsIndexedFn = func(eventID string) (bool, error) {
-		return bleveClient.IsEventIDExists(eventID)
-	}
-	batchIndexer.AddEventIDFn = func(eventID string) error {
-		return bleveClient.AddEventID(eventID)
-	}
-	// Flush callbacks for live messages — make documents immediately searchable
-	batchIndexer.FlushFn = func() error {
-		if err := bleveClient.Flush(); err != nil {
-			log.Printf("WARN bot: failed to flush document batch: %v", err)
-		}
-		return err
-	}
-	batchIndexer.FlushEventIDFn = func() error {
-		if err := bleveClient.FlushEventID(); err != nil {
-			log.Printf("WARN bot: failed to flush eventID batch: %v", err)
-		}
-		return err
-	}
-	batchIndexer.ProcessImageDescFn = func(images []indexer.PendingImage) ([]indexer.PendingImage, error) {
-		var failed []indexer.PendingImage
-		for i, img := range images {
-			desc, err := imageProcessor.DescribeImageOnly(img.RawURL, img.Timestamp)
-			if err != nil {
-				log.Printf("Failed to describe deferred image %s: %v", img.EventID, err)
-				failed = append(failed, img)
-				continue
-			}
-			images[i].Description = desc
-		}
-		return images, nil
-	}
-	batchIndexer.ProcessImageEmbedFn = func(images []indexer.PendingImage) ([]indexer.PendingImage, error) {
-		var failed []indexer.PendingImage
-		for _, img := range images {
-			if img.Description == "" {
-				failed = append(failed, img)
-				continue
-			}
-
-			vector, err := embedClient.CreateEmbedding(img.Description, "search_document: ")
-			if err != nil {
-				log.Printf("Failed to embed deferred image %s: %v", img.EventID, err)
-				failed = append(failed, img)
-				continue
-			}
-
-			doc := indexer.IndexedDocument{
-				ID:        fmt.Sprintf("%s:%s", img.RoomID, img.EventID),
-				EventID:   img.EventID,
-				RoomID:    img.RoomID,
-				UserID:    img.UserID,
-				Timestamp: img.Timestamp,
-				EventType: "m.room.message",
-				ImageDesc: img.Description,
-				Vector:    vector,
-				RawURL:    img.RawURL,
-				FileName:  img.FileName,
-				MimeType:  img.MimeType,
-			}
-
-			if err := bleveClient.IndexDocumentStruct(doc); err != nil {
-				log.Printf("Failed to index deferred image %s: %v", img.EventID, err)
-				failed = append(failed, img)
-				continue
-			}
-			if err := bleveClient.AddEventID(img.EventID); err != nil {
-				log.Printf("Failed to mark event ID %s as processed: %v", img.EventID, err)
-			}
-		}
-		return failed, nil
-	}
-	batchIndexer.ProcessDeferredTextFn = func(texts []indexer.PendingMessage) ([]indexer.PendingMessage, error) {
-		var failed []indexer.PendingMessage
-		for _, msg := range texts {
-			vector, err := embedClient.CreateEmbedding(msg.Text, "search_document: ")
-			if err != nil {
-				log.Printf("Failed to embed deferred text %s: %v", msg.EventID, err)
-				failed = append(failed, msg)
-				continue
-			}
-
-			doc := indexer.IndexedDocument{
-				ID:        fmt.Sprintf("%s:%s", msg.RoomID, msg.EventID),
-				EventID:   msg.EventID,
-				RoomID:    msg.RoomID,
-				UserID:    msg.UserID,
-				Timestamp: msg.Timestamp,
-				EventType: msg.EventType,
-				Text:      msg.Text,
-				Vector:    vector,
-			}
-
-			if err := bleveClient.IndexDocumentStruct(doc); err != nil {
-				log.Printf("Failed to index deferred text %s: %v", msg.EventID, err)
-				failed = append(failed, msg)
-				continue
-			}
-			if err := bleveClient.AddEventID(msg.EventID); err != nil {
-				log.Printf("Failed to mark event ID %s as processed: %v", msg.EventID, err)
-			}
-		}
-		return failed, nil
-	}
 
 	// Create E2EE crypto infrastructure
 	// Use INFO level to suppress crypto module debug noise but keep important startup messages
@@ -766,7 +644,7 @@ func (b *Bot) handleEvent(ev *event.Event) {
 			Text:      text,
 		}
 
-		b.batchIndexer.OnTextMessageWithBuffering(msg, true)
+		b.batchIndexer.OnTextMessageWithBuffering(msg, false)
 		b.sendReadReceipt(ev.RoomID, ev.ID)
 	} else if body.MsgType == event.MsgImage {
 		// Index as image message
@@ -925,13 +803,10 @@ func (b *Bot) handleMembershipEvent(ev *event.Event) {
 func (b *Bot) handleSyncResponse(ctx context.Context, resp *mautrix.RespSync, since string) bool {
 	// Auto-join invited rooms (skip already processed)
 	for roomID := range resp.Rooms.Invite {
-		b.inviteMu.Lock()
 		if b.joinedInviteRooms[roomID.String()] {
-			b.inviteMu.Unlock()
 			continue
 		}
 		b.joinedInviteRooms[roomID.String()] = true
-		b.inviteMu.Unlock()
 
 		log.Printf("Bot has invite to room %s, joining...", roomID)
 
@@ -1039,26 +914,25 @@ func (b *Bot) fetchPreviews(text string) []*event.LinkPreview {
 	ctx, cancel := context.WithTimeout(context.Background(), b.cfg.LinkPreview.Timeout)
 	defer cancel()
 
-	var wg sync.WaitGroup
-	mu := sync.Mutex{}
-	var previews []*event.LinkPreview
+	ch := make(chan *event.LinkPreview, len(urls))
 
 	for _, u := range urls {
-		wg.Add(1)
 		go func(rawURL string) {
-			defer wg.Done()
 			preview, err := b.fetchPreviewViaAPI(ctx, rawURL)
 			if err != nil {
 				log.Printf("Failed to get preview for %s: %v", rawURL, err)
 				return
 			}
-			mu.Lock()
-			previews = append(previews, preview)
-			mu.Unlock()
+			ch <- preview
 		}(u)
 	}
 
-	wg.Wait()
+	var previews []*event.LinkPreview
+	for range urls {
+		if preview, ok := <-ch; ok {
+			previews = append(previews, preview)
+		}
+	}
 	return previews
 }
 
@@ -1147,11 +1021,6 @@ func (b *Bot) ScanRoomHistory(roomID string, cutoffUnix int64) {
 
 	log.Printf("INFO bot: starting history scan for room %s (cutoff: %d)", roomID, cutoffUnix)
 
-	// Flush pending event IDs so dedup checks in this scan see them
-	if b.batchIndexer.FlushEventIDFn != nil {
-		_ = b.batchIndexer.FlushEventIDFn()
-	}
-
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		resp, err := b.client.Messages(ctx, id.RoomID(roomID), from, "", mautrix.Direction('b'), nil, 100)
@@ -1216,7 +1085,7 @@ func (b *Bot) ScanRoomHistory(roomID string, cutoffUnix int64) {
 					EventType: "m.room.message",
 					Text:      text,
 				}
-				indexed := b.batchIndexer.OnTextMessageWithBuffering(msg, false)
+				indexed := b.batchIndexer.OnTextMessageWithBuffering(msg, true)
 				textsIndexed += indexed
 				if indexed > 0 {
 					hasNewEvents = true
@@ -1268,8 +1137,12 @@ func (b *Bot) ScanRoomHistory(roomID string, cutoffUnix int64) {
 	textsIndexed += flushed
 
 	// Flush document batch after history scan to persist all indexed documents
-	if b.batchIndexer.FlushFn != nil {
-		_ = b.batchIndexer.FlushFn()
+	// (history uses batch=true — documents accumulated, now flush them)
+	if err := b.bleveClient.Flush(); err != nil {
+		log.Printf("WARN bot: failed to flush document batch after history scan: %v", err)
+	}
+	if err := b.bleveClient.FlushEventID(); err != nil {
+		log.Printf("WARN bot: failed to flush eventID batch after history scan: %v", err)
 	}
 
 	log.Printf("INFO bot: scanned room %s: %d texts indexed, %d images deferred, %d pages scanned", roomID, textsIndexed, imagesDeferred, pagesScanned)

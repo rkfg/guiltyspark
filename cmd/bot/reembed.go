@@ -195,8 +195,6 @@ func reembedDocs(bleveClient *indexer.BleveClient, embedClient *embedding.Client
 		updated++
 	}
 
-	bleveClient.FlushEventID()
-
 	elapsed := time.Since(start)
 	log.Printf("INFO reembed: total=%d updated=%d skipped=%d failed=%d elapsed=%s",
 		total, updated, skipped, failed, elapsed.Round(time.Second))
