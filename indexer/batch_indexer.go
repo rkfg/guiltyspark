@@ -9,8 +9,6 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
-
-	"github.com/rkfg/guiltyspark/embedding"
 )
 
 type TaskType int
@@ -100,8 +98,8 @@ type BatchIndexer struct {
 	deferredTimerCh chan struct{}
 	saveTimerCh     chan struct{}
 
-	bleveClient *BleveClient
-	embedClient *embedding.Client
+	bleveClient BleveClientInterface
+	embedClient EmbedClientInterface
 	imageProc   *ImageProcessor
 
 	embedHour   int
@@ -122,7 +120,7 @@ type PendingImage struct {
 
 const persistFile = "deferred.json"
 
-func NewBatchIndexer(embedHour, embedMinute int, persistDir string, bleveClient *BleveClient, embedClient *embedding.Client, imageProc *ImageProcessor) *BatchIndexer {
+func NewBatchIndexer(embedHour, embedMinute int, persistDir string, bleveClient BleveClientInterface, embedClient EmbedClientInterface, imageProc *ImageProcessor) *BatchIndexer {
 	b := &BatchIndexer{
 		taskCh:      make(chan IndexTask, 1000),
 		stopCh:      make(chan struct{}),
