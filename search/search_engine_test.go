@@ -70,14 +70,14 @@ func TestExactSearch_finds_matching_text(t *testing.T) {
 	eng := NewEngine(bc, newMockEmbedClientForSearch(), &config.SearchConfig{ResultLimit: 10})
 
 	// Find in specific room
-	result, err := eng.ExactSearch("hello", "room1", "")
+	result, err := eng.ExactSearch("hello", SearchArgs{RoomID: "room1", UserFilter: ""})
 	require.NoError(t, err)
 	assert.Equal(t, 1, len(result.Exact))
 	assert.Equal(t, "evt1", result.Exact[0].EventID)
 	assert.Equal(t, "room1", result.Exact[0].RoomID)
 
 	// Find across all rooms
-	result, err = eng.ExactSearch("hello", "", "")
+	result, err = eng.ExactSearch("hello", SearchArgs{RoomID: "", UserFilter: ""})
 	require.NoError(t, err)
 	assert.Equal(t, 2, len(result.Exact))
 	// Both should be found
@@ -105,7 +105,7 @@ func TestExactSearch_does_not_find_non_matching_text(t *testing.T) {
 
 	eng := NewEngine(bc, newMockEmbedClientForSearch(), &config.SearchConfig{ResultLimit: 10})
 
-	result, err := eng.ExactSearch("goodbye", "room1", "")
+	result, err := eng.ExactSearch("goodbye", SearchArgs{RoomID: "room1", UserFilter: ""})
 	require.NoError(t, err)
 	assert.Equal(t, 0, len(result.Exact))
 }
@@ -135,7 +135,7 @@ func TestExactSearch_filters_by_room(t *testing.T) {
 	eng := NewEngine(bc, newMockEmbedClientForSearch(), &config.SearchConfig{ResultLimit: 10})
 
 	// Only room1 should be found
-	result, err := eng.ExactSearch("hello", "room1", "")
+	result, err := eng.ExactSearch("hello", SearchArgs{RoomID: "room1", UserFilter: ""})
 	require.NoError(t, err)
 	assert.Equal(t, 1, len(result.Exact))
 	assert.Equal(t, "room1", result.Exact[0].RoomID)
@@ -166,13 +166,13 @@ func TestExactSearch_filters_by_user(t *testing.T) {
 	eng := NewEngine(bc, newMockEmbedClientForSearch(), &config.SearchConfig{ResultLimit: 10})
 
 	// Only @alice's messages
-	result, err := eng.ExactSearch("hello", "", "@alice:example.org")
+	result, err := eng.ExactSearch("hello", SearchArgs{RoomID: "", UserFilter: "@alice:example.org"})
 	require.NoError(t, err)
 	assert.Equal(t, 1, len(result.Exact))
 	assert.Equal(t, "@alice:example.org", result.Exact[0].UserID)
 
 	// Only @bob's messages
-	result, err = eng.ExactSearch("hello", "", "@bob:example.org")
+	result, err = eng.ExactSearch("hello", SearchArgs{RoomID: "", UserFilter: "@bob:example.org"})
 	require.NoError(t, err)
 	assert.Equal(t, 1, len(result.Exact))
 	assert.Equal(t, "@bob:example.org", result.Exact[0].UserID)
@@ -185,7 +185,7 @@ func TestExactSearch_all_stop_words_returns_empty(t *testing.T) {
 	eng := NewEngine(bc, newMockEmbedClientForSearch(), &config.SearchConfig{ResultLimit: 10})
 
 	// Only stop words — should return empty search result (no Bleve query issued)
-	result, err := eng.ExactSearch("и в на что это", "", "")
+	result, err := eng.ExactSearch("и в на что это", SearchArgs{RoomID: "", UserFilter: ""})
 	require.NoError(t, err)
 	// Query should be empty since all words are stop words
 	assert.Equal(t, 0, len(result.Exact))
@@ -208,7 +208,7 @@ func TestExactSearch_image_desc_found(t *testing.T) {
 
 	eng := NewEngine(bc, newMockEmbedClientForSearch(), &config.SearchConfig{ResultLimit: 10})
 
-	result, err := eng.ExactSearch("cat", "", "")
+	result, err := eng.ExactSearch("cat", SearchArgs{RoomID: "", UserFilter: ""})
 	require.NoError(t, err)
 	assert.Equal(t, 1, len(result.Exact))
 	assert.Equal(t, "a cat sitting on a sofa", result.Exact[0].ImageDesc)
@@ -234,7 +234,7 @@ func TestExactSearch_limit_results(t *testing.T) {
 
 	eng := NewEngine(bc, newMockEmbedClientForSearch(), &config.SearchConfig{ResultLimit: 3})
 
-	result, err := eng.ExactSearch("hello", "", "")
+	result, err := eng.ExactSearch("hello", SearchArgs{RoomID: "", UserFilter: ""})
 	require.NoError(t, err)
 	assert.Equal(t, 3, len(result.Exact))
 	// Should be limited to 3 results (top scoring)
@@ -273,7 +273,7 @@ func TestSemanticSearch_finds_matching_results(t *testing.T) {
 	eng := NewEngine(bc, newMockEmbedClientForSearch(), &config.SearchConfig{ResultLimit: 10})
 
 	// Should find the document with matching vector
-	result, err := eng.SemanticSearch("hello world", "room1", "")
+	result, err := eng.SemanticSearch("hello world", SearchArgs{RoomID: "room1", UserFilter: ""})
 	require.NoError(t, err)
 	assert.Equal(t, "hello world", result.Query)
 	assert.Equal(t, 1, len(result.Semantic))
@@ -288,7 +288,7 @@ func TestSemanticSearch_does_not_find_non_matching_results(t *testing.T) {
 	// No documents with vectors
 	eng := NewEngine(bc, newMockEmbedClientForSearch(), &config.SearchConfig{ResultLimit: 10})
 
-	result, err := eng.SemanticSearch("hello world", "room1", "")
+	result, err := eng.SemanticSearch("hello world", SearchArgs{RoomID: "room1", UserFilter: ""})
 	require.NoError(t, err)
 	assert.Equal(t, 0, len(result.Semantic))
 }
@@ -335,7 +335,7 @@ func TestSemanticSearch_filters_by_room(t *testing.T) {
 	eng := NewEngine(bc, newMockEmbedClientForSearch(), &config.SearchConfig{ResultLimit: 10})
 
 	// Only room1 should be found
-	result, err := eng.SemanticSearch("hello", "room1", "")
+	result, err := eng.SemanticSearch("hello", SearchArgs{RoomID: "room1", UserFilter: ""})
 	require.NoError(t, err)
 	assert.Equal(t, 1, len(result.Semantic))
 	assert.Equal(t, "room1", result.Semantic[0].RoomID)
@@ -381,13 +381,13 @@ func TestSemanticSearch_filters_by_user(t *testing.T) {
 	eng := NewEngine(bc, newMockEmbedClientForSearch(), &config.SearchConfig{ResultLimit: 10})
 
 	// Only @alice's results
-	result, err := eng.SemanticSearch("hello", "", "@alice:example.org")
+	result, err := eng.SemanticSearch("hello", SearchArgs{RoomID: "", UserFilter: "@alice:example.org"})
 	require.NoError(t, err)
 	assert.Equal(t, 1, len(result.Semantic))
 	assert.Equal(t, "@alice:example.org", result.Semantic[0].UserID)
 
 	// Only @bob's results
-	result, err = eng.SemanticSearch("hello", "", "@bob:example.org")
+	result, err = eng.SemanticSearch("hello", SearchArgs{RoomID: "", UserFilter: "@bob:example.org"})
 	require.NoError(t, err)
 	assert.Equal(t, 1, len(result.Semantic))
 	assert.Equal(t, "@bob:example.org", result.Semantic[0].UserID)
@@ -399,7 +399,7 @@ func TestSemanticSearch_all_stop_words_returns_empty(t *testing.T) {
 
 	eng := NewEngine(bc, newMockEmbedClientForSearch(), &config.SearchConfig{ResultLimit: 10})
 
-	result, err := eng.SemanticSearch("и в на что это", "", "")
+	result, err := eng.SemanticSearch("и в на что это", SearchArgs{RoomID: "", UserFilter: ""})
 	require.NoError(t, err)
 	assert.Equal(t, "и в на что это", result.Query)
 	assert.Equal(t, 0, len(result.Semantic))
@@ -432,7 +432,7 @@ func TestSemanticSearch_limit_results(t *testing.T) {
 
 	eng := NewEngine(bc, newMockEmbedClientForSearch(), &config.SearchConfig{ResultLimit: 2})
 
-	result, err := eng.SemanticSearch("hello", "", "")
+	result, err := eng.SemanticSearch("hello", SearchArgs{RoomID: "", UserFilter: ""})
 	require.NoError(t, err)
 	assert.Equal(t, 2, len(result.Semantic))
 	// Just check that results are returned and limited to 2,
@@ -481,6 +481,244 @@ func TestFormatResults_only_semantic(t *testing.T) {
 
 	assert.NotContains(t, text, "Exact matches:")
 	assert.Contains(t, text, "Similar (semantic):")
+}
+
+func TestExactSearch_filters_by_before_date(t *testing.T) {
+	bc, cleanup := createTestBleveClient(t)
+	defer cleanup()
+
+	// Use UTC timestamps (Matrix timestamps are UTC)
+	ts1 := time.Date(2021, 6, 1, 12, 0, 0, 0, time.UTC).UnixMilli()
+	ts2 := time.Date(2023, 1, 15, 12, 0, 0, 0, time.UTC).UnixMilli()
+
+	before20220101 := time.Date(2022, 1, 1, 0, 0, 0, 0, localLoc)
+
+	addDoc(t, bc, indexer.IndexedDocument{
+		ID:        "room1:evt1",
+		EventID:   "evt1",
+		RoomID:    "room1",
+		UserID:    "@alice:example.org",
+		Text:      "hello",
+		Timestamp: ts1,
+	})
+	addDoc(t, bc, indexer.IndexedDocument{
+		ID:        "room1:evt2",
+		EventID:   "evt2",
+		RoomID:    "room1",
+		UserID:    "@bob:example.org",
+		Text:      "hello",
+		Timestamp: ts2,
+	})
+
+	eng := NewEngine(bc, newMockEmbedClientForSearch(), &config.SearchConfig{ResultLimit: 10})
+
+	// Only messages before 2022-01-01 local — ts1 (2021-06-01) should be included
+	result, err := eng.ExactSearch("hello", SearchArgs{RoomID: "room1", UserFilter: "", BeforeDate: &before20220101, AfterDate: nil})
+	require.NoError(t, err)
+	assert.Equal(t, 1, len(result.Exact))
+	assert.Equal(t, "evt1", result.Exact[0].EventID)
+}
+
+func TestExactSearch_filters_by_after_date(t *testing.T) {
+	bc, cleanup := createTestBleveClient(t)
+	defer cleanup()
+
+	ts1 := time.Date(2021, 6, 1, 12, 0, 0, 0, time.UTC).UnixMilli()
+	ts2 := time.Date(2023, 1, 15, 12, 0, 0, 0, time.UTC).UnixMilli()
+
+	after20220101 := time.Date(2022, 1, 1, 0, 0, 0, 0, localLoc)
+
+	addDoc(t, bc, indexer.IndexedDocument{
+		ID:        "room1:evt1",
+		EventID:   "evt1",
+		RoomID:    "room1",
+		UserID:    "@alice:example.org",
+		Text:      "hello",
+		Timestamp: ts1,
+	})
+	addDoc(t, bc, indexer.IndexedDocument{
+		ID:        "room1:evt2",
+		EventID:   "evt2",
+		RoomID:    "room1",
+		UserID:    "@bob:example.org",
+		Text:      "hello",
+		Timestamp: ts2,
+	})
+
+	eng := NewEngine(bc, newMockEmbedClientForSearch(), &config.SearchConfig{ResultLimit: 10})
+
+	// Only messages after 2022-01-01 local — ts2 (2023-01-15) should be included
+	result, err := eng.ExactSearch("hello", SearchArgs{RoomID: "room1", UserFilter: "", BeforeDate: nil, AfterDate: &after20220101})
+	require.NoError(t, err)
+	assert.Equal(t, 1, len(result.Exact))
+	assert.Equal(t, "evt2", result.Exact[0].EventID)
+}
+
+func TestExactSearch_filters_by_before_and_after_date(t *testing.T) {
+	bc, cleanup := createTestBleveClient(t)
+	defer cleanup()
+
+	ts1 := time.Date(2020, 6, 1, 12, 0, 0, 0, time.UTC).UnixMilli()
+	ts2 := time.Date(2021, 6, 15, 12, 0, 0, 0, time.UTC).UnixMilli()
+	ts3 := time.Date(2023, 6, 1, 12, 0, 0, 0, time.UTC).UnixMilli()
+
+	before20230101 := time.Date(2023, 1, 1, 0, 0, 0, 0, localLoc)
+	after20210101 := time.Date(2021, 1, 1, 0, 0, 0, 0, localLoc)
+
+	addDoc(t, bc, indexer.IndexedDocument{
+		ID:        "room1:evt1",
+		EventID:   "evt1",
+		RoomID:    "room1",
+		UserID:    "@alice:example.org",
+		Text:      "hello",
+		Timestamp: ts1,
+	})
+	addDoc(t, bc, indexer.IndexedDocument{
+		ID:        "room1:evt2",
+		EventID:   "evt2",
+		RoomID:    "room1",
+		UserID:    "@bob:example.org",
+		Text:      "hello",
+		Timestamp: ts2,
+	})
+	addDoc(t, bc, indexer.IndexedDocument{
+		ID:        "room1:evt3",
+		EventID:   "evt3",
+		RoomID:    "room1",
+		UserID:    "@charlie:example.org",
+		Text:      "hello",
+		Timestamp: ts3,
+	})
+
+	eng := NewEngine(bc, newMockEmbedClientForSearch(), &config.SearchConfig{ResultLimit: 10})
+
+	// Only messages between 2021-01-01 and 2023-01-01 local — ts2 (2021-06-15) should be included
+	result, err := eng.ExactSearch("hello", SearchArgs{RoomID: "room1", UserFilter: "", BeforeDate: &before20230101, AfterDate: &after20210101})
+	require.NoError(t, err)
+	assert.Equal(t, 1, len(result.Exact))
+	assert.Equal(t, "evt2", result.Exact[0].EventID)
+}
+
+func TestSemanticSearch_filters_by_before_date(t *testing.T) {
+	bc, cleanup := createTestBleveClient(t)
+	defer cleanup()
+
+	ts1 := time.Date(2021, 6, 1, 12, 0, 0, 0, time.UTC).UnixMilli()
+	ts2 := time.Date(2023, 1, 15, 12, 0, 0, 0, time.UTC).UnixMilli()
+
+	before20220101 := time.Date(2022, 1, 1, 0, 0, 0, 0, localLoc)
+
+	addDoc(t, bc, indexer.IndexedDocument{
+		ID:        "room1:evt1",
+		EventID:   "evt1",
+		RoomID:    "room1",
+		UserID:    "@alice:example.org",
+		Text:      "hello",
+		Timestamp: ts1,
+		Vector:    []float32{0.1, 0.2, 0.3},
+	})
+	addDoc(t, bc, indexer.IndexedDocument{
+		ID:        "room1:evt2",
+		EventID:   "evt2",
+		RoomID:    "room1",
+		UserID:    "@bob:example.org",
+		Text:      "hello",
+		Timestamp: ts2,
+		Vector:    []float32{0.1, 0.2, 0.3},
+	})
+
+	eng := NewEngine(bc, newMockEmbedClientForSearch(), &config.SearchConfig{ResultLimit: 10})
+
+	// Only messages before 2022-01-01 local — ts1 (2021-06-01) should be included
+	result, err := eng.SemanticSearch("hello", SearchArgs{RoomID: "room1", UserFilter: "", BeforeDate: &before20220101, AfterDate: nil})
+	require.NoError(t, err)
+	assert.Equal(t, 1, len(result.Semantic))
+	assert.Equal(t, "evt1", result.Semantic[0].EventID)
+}
+
+func TestSemanticSearch_filters_by_after_date(t *testing.T) {
+	bc, cleanup := createTestBleveClient(t)
+	defer cleanup()
+
+	ts1 := time.Date(2021, 6, 1, 12, 0, 0, 0, time.UTC).UnixMilli()
+	ts2 := time.Date(2023, 1, 15, 12, 0, 0, 0, time.UTC).UnixMilli()
+
+	after20220101 := time.Date(2022, 1, 1, 0, 0, 0, 0, localLoc)
+
+	addDoc(t, bc, indexer.IndexedDocument{
+		ID:        "room1:evt1",
+		EventID:   "evt1",
+		RoomID:    "room1",
+		UserID:    "@alice:example.org",
+		Text:      "hello",
+		Timestamp: ts1,
+		Vector:    []float32{0.1, 0.2, 0.3},
+	})
+	addDoc(t, bc, indexer.IndexedDocument{
+		ID:        "room1:evt2",
+		EventID:   "evt2",
+		RoomID:    "room1",
+		UserID:    "@bob:example.org",
+		Text:      "hello",
+		Timestamp: ts2,
+		Vector:    []float32{0.1, 0.2, 0.3},
+	})
+
+	eng := NewEngine(bc, newMockEmbedClientForSearch(), &config.SearchConfig{ResultLimit: 10})
+
+	// Only messages after 2022-01-01 local — ts2 (2023-01-15) should be included
+	result, err := eng.SemanticSearch("hello", SearchArgs{RoomID: "room1", UserFilter: "", BeforeDate: nil, AfterDate: &after20220101})
+	require.NoError(t, err)
+	assert.Equal(t, 1, len(result.Semantic))
+	assert.Equal(t, "evt2", result.Semantic[0].EventID)
+}
+
+func TestSemanticSearch_filters_by_before_and_after_date(t *testing.T) {
+	bc, cleanup := createTestBleveClient(t)
+	defer cleanup()
+
+	ts1 := time.Date(2020, 6, 1, 12, 0, 0, 0, time.UTC).UnixMilli()
+	ts2 := time.Date(2021, 6, 15, 12, 0, 0, 0, time.UTC).UnixMilli()
+	ts3 := time.Date(2023, 6, 1, 12, 0, 0, 0, time.UTC).UnixMilli()
+
+	before20230101 := time.Date(2023, 1, 1, 0, 0, 0, 0, localLoc)
+	after20210101 := time.Date(2021, 1, 1, 0, 0, 0, 0, localLoc)
+
+	addDoc(t, bc, indexer.IndexedDocument{
+		ID:        "room1:evt1",
+		EventID:   "evt1",
+		RoomID:    "room1",
+		UserID:    "@alice:example.org",
+		Text:      "hello",
+		Timestamp: ts1,
+		Vector:    []float32{0.1, 0.2, 0.3},
+	})
+	addDoc(t, bc, indexer.IndexedDocument{
+		ID:        "room1:evt2",
+		EventID:   "evt2",
+		RoomID:    "room1",
+		UserID:    "@bob:example.org",
+		Text:      "hello",
+		Timestamp: ts2,
+		Vector:    []float32{0.1, 0.2, 0.3},
+	})
+	addDoc(t, bc, indexer.IndexedDocument{
+		ID:        "room1:evt3",
+		EventID:   "evt3",
+		RoomID:    "room1",
+		UserID:    "@charlie:example.org",
+		Text:      "hello",
+		Timestamp: ts3,
+		Vector:    []float32{0.1, 0.2, 0.3},
+	})
+
+	eng := NewEngine(bc, newMockEmbedClientForSearch(), &config.SearchConfig{ResultLimit: 10})
+
+	// Only messages between 2021-01-01 and 2023-01-01 local — ts2 (2021-06-15) should be included
+	result, err := eng.SemanticSearch("hello", SearchArgs{RoomID: "room1", UserFilter: "", BeforeDate: &before20230101, AfterDate: &after20210101})
+	require.NoError(t, err)
+	assert.Equal(t, 1, len(result.Semantic))
+	assert.Equal(t, "evt2", result.Semantic[0].EventID)
 }
 
 func TestFormatSemanticResults_only_semantic(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/blevesearch/bleve/v2"
 	_ "github.com/blevesearch/bleve/v2/analysis/lang/ru"
@@ -37,6 +38,14 @@ type bleveTaskResponse struct {
 	Exists bool
 	Count  int
 	Err    error
+}
+
+// SearchArgs contains parameters for search queries.
+type SearchArgs struct {
+	RoomID     string
+	UserFilter string
+	BeforeDate *time.Time
+	AfterDate  *time.Time
 }
 
 type BleveClient struct {
@@ -188,7 +197,7 @@ func (b *BleveClient) IndexDocumentStruct(doc IndexedDocument) error {
 	return resp.Err
 }
 
-func (b *BleveClient) SearchExact(queryText string, roomID string) (*bleve.SearchResult, error) {
+func (b *BleveClient) SearchExact(queryText string, args SearchArgs) (*bleve.SearchResult, error) {
 	// Use MatchQuery — it searches only in the specified field
 	textQ := bleve.NewMatchQuery(queryText)
 	textQ.SetField("text")
@@ -199,11 +208,14 @@ func (b *BleveClient) SearchExact(queryText string, roomID string) (*bleve.Searc
 	// Use DisjunctionQuery for OR search across text and image_desc
 	disjQ := bleve.NewDisjunctionQuery(textQ, imageQ)
 
+	filterParts := b.buildSearchFilters(args)
+
 	var q query.Query
-	if roomID != "" {
-		filterQ := bleve.NewTermQuery(roomID)
-		filterQ.SetField("room_id")
-		q = bleve.NewConjunctionQuery(disjQ, filterQ)
+	if len(filterParts) > 0 {
+		q = bleve.NewConjunctionQuery(disjQ)
+		for _, fp := range filterParts {
+			q = bleve.NewConjunctionQuery(q, fp)
+		}
 	} else {
 		q = disjQ
 	}
@@ -220,7 +232,7 @@ func (b *BleveClient) SearchExact(queryText string, roomID string) (*bleve.Searc
 	return result, nil
 }
 
-func (b *BleveClient) SearchSemantic(queryVector []float32, roomID string) (*bleve.SearchResult, error) {
+func (b *BleveClient) SearchSemantic(queryVector []float32, args SearchArgs) (*bleve.SearchResult, error) {
 	searchReq := bleve.NewSearchRequest(bleve.NewMatchAllQuery())
 	searchReq.Size = 50
 	searchReq.Fields = []string{"text", "image_desc", "user_id", "room_id", "timestamp", "event_id", "raw_url", "file_name", "mime_type"}
@@ -229,11 +241,44 @@ func (b *BleveClient) SearchSemantic(queryVector []float32, roomID string) (*ble
 	// Room filtering is applied post-search (in search.Engine.Search).
 	searchReq.AddKNN("vector", queryVector, 50, 1.0)
 
+	filterParts := b.buildSearchFilters(args)
+	if len(filterParts) > 0 {
+		// Wrap kNN + filters in a ConjunctionQuery
+		knnQuery := bleve.NewMatchAllQuery()
+		searchReq.Query = bleve.NewConjunctionQuery(knnQuery)
+		for _, fp := range filterParts {
+			searchReq.Query = bleve.NewConjunctionQuery(searchReq.Query, fp)
+		}
+	}
+
 	result, err := b.index.Search(searchReq)
 	if err != nil {
 		return nil, err
 	}
 	return result, nil
+}
+
+// buildSearchFilters creates query filters for room and date range.
+func (b *BleveClient) buildSearchFilters(args SearchArgs) []query.Query {
+	var filterParts []query.Query
+	if args.RoomID != "" {
+		filterQ := bleve.NewTermQuery(args.RoomID)
+		filterQ.SetField("room_id")
+		filterParts = append(filterParts, filterQ)
+	}
+	if args.BeforeDate != nil {
+		beforeMs := float64(LocalToUTCMillis(args.BeforeDate))
+		rangeQ := bleve.NewNumericRangeQuery(nil, &beforeMs)
+		rangeQ.SetField("timestamp")
+		filterParts = append(filterParts, rangeQ)
+	}
+	if args.AfterDate != nil {
+		afterMs := float64(LocalToUTCMillis(args.AfterDate))
+		rangeQ := bleve.NewNumericRangeQuery(&afterMs, nil)
+		rangeQ.SetField("timestamp")
+		filterParts = append(filterParts, rangeQ)
+	}
+	return filterParts
 }
 
 // addEventIDToBuffer accumulates an event ID in eventIDBuf, flushing when the batch is full.
@@ -586,4 +631,10 @@ func (b *BleveClient) FlushEventID() error {
 	b.taskCh <- bleveTask{Type: taskFlushEventID, RespCh: respCh}
 	<-respCh
 	return nil
+}
+
+// LocalToUTCMillis converts a local midnight date to the corresponding UTC timestamp.
+// "before:2026-05-20" in +03:00 means before May 20 00:00 local = before May 19 21:00 UTC.
+func LocalToUTCMillis(d *time.Time) int64 {
+	return d.UTC().UnixMilli()
 }

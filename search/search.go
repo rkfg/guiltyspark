@@ -26,6 +26,8 @@ type Result struct {
 	Type      string // "text" or "image"
 }
 
+type SearchArgs = indexer.SearchArgs
+
 type SearchResult struct {
 	Exact       []Result
 	Semantic    []Result
@@ -101,17 +103,29 @@ func limitResults(results []Result, limit int) []Result {
 	return results
 }
 
-func filterHitsByUserAndRoom(hits []*search.DocumentMatch, roomFilter, userFilter string) []Result {
+func filterHitsByUserAndRoom(hits []*search.DocumentMatch, args SearchArgs) []Result {
 	var results []Result
 	for _, hit := range hits {
-		if len(roomFilter) > 0 && hit.Fields["room_id"] != roomFilter {
+		if len(args.RoomID) > 0 && hit.Fields["room_id"] != args.RoomID {
 			continue
 		}
-		if len(userFilter) > 0 && hit.Fields["user_id"] != userFilter {
+		if len(args.UserFilter) > 0 && hit.Fields["user_id"] != args.UserFilter {
 			continue
 		}
 		r := convertHit(hit)
 		r.Score = hit.Score
+		if args.BeforeDate != nil {
+			beforeTs := indexer.LocalToUTCMillis(args.BeforeDate)
+			if r.Timestamp >= beforeTs {
+				continue
+			}
+		}
+		if args.AfterDate != nil {
+			afterTs := indexer.LocalToUTCMillis(args.AfterDate)
+			if r.Timestamp < afterTs {
+				continue
+			}
+		}
 		results = append(results, r)
 	}
 	return results
@@ -188,7 +202,7 @@ func formatResult(r Result, idx int) (string, string) {
 }
 
 // SemanticSearch performs only semantic (vector) search without exact text search.
-func (e *Engine) SemanticSearch(queryText string, roomFilter, userFilter string) (*SearchResult, error) {
+func (e *Engine) SemanticSearch(queryText string, args SearchArgs) (*SearchResult, error) {
 	filteredQuery, vector := e.prepareQuery(queryText)
 	if filteredQuery == "" {
 		return &SearchResult{Query: queryText}, nil
@@ -198,19 +212,19 @@ func (e *Engine) SemanticSearch(queryText string, roomFilter, userFilter string)
 	result.QueryVector = vector
 
 	// Semantic search using Bleve native kNN with FAISS backend
-	semanticResults, err := e.bleveClient.SearchSemantic(vector, roomFilter)
+	semanticResults, err := e.bleveClient.SearchSemantic(vector, args)
 	if err != nil {
 		return nil, fmt.Errorf("semantic search: %w", err)
 	}
 
-	result.Semantic = filterHitsByUserAndRoom(semanticResults.Hits, roomFilter, userFilter)
+	result.Semantic = filterHitsByUserAndRoom(semanticResults.Hits, args)
 	result.Semantic = limitResults(result.Semantic, e.cfg.ResultLimit)
 
 	return result, nil
 }
 
 // ExactSearch performs only exact (text) search without semantic search.
-func (e *Engine) ExactSearch(queryText string, roomFilter, userFilter string) (*SearchResult, error) {
+func (e *Engine) ExactSearch(queryText string, args SearchArgs) (*SearchResult, error) {
 	filteredQuery := filterStopWords(queryText)
 	if filteredQuery == "" {
 		return &SearchResult{Query: queryText}, nil
@@ -219,12 +233,12 @@ func (e *Engine) ExactSearch(queryText string, roomFilter, userFilter string) (*
 	result := &SearchResult{Query: filteredQuery}
 
 	// Exact search
-	exactResults, err := e.bleveClient.SearchExact(filteredQuery, roomFilter)
+	exactResults, err := e.bleveClient.SearchExact(filteredQuery, args)
 	if err != nil {
 		return nil, fmt.Errorf("exact search: %w", err)
 	}
 
-	result.Exact = filterHitsByUserAndRoom(exactResults.Hits, "", userFilter)
+	result.Exact = filterHitsByUserAndRoom(exactResults.Hits, args)
 	result.Exact = limitResults(result.Exact, e.cfg.ResultLimit)
 
 	return result, nil

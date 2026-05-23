@@ -91,7 +91,7 @@ func TestBleveClient_integration(t *testing.T) {
 	assert.Equal(t, 1, count)
 
 	// SearchExact
-	result, err := bc.SearchExact("hello", "room1")
+	result, err := bc.SearchExact("hello", SearchArgs{RoomID: "room1"})
 	require.NoError(t, err)
 	assert.Equal(t, 1, int(result.Total))
 

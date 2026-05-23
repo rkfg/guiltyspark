@@ -5,6 +5,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/blevesearch/bleve/v2/search"
 	"github.com/rkfg/guiltyspark/config"
 	"github.com/stretchr/testify/assert"
 )
@@ -125,6 +126,61 @@ func TestFormatResults_with_results(t *testing.T) {
 	assert.Contains(t, html, "Search results for:")
 	assert.Contains(t, html, "Exact matches:")
 	assert.Contains(t, html, "Similar (semantic):")
+}
+
+func TestFilterStopWords_date_filters_not_in_query(t *testing.T) {
+	// Date filters are not stop words, they should pass through
+	got := filterStopWords("before:2026-05-02 after:2026-02-03")
+	assert.Equal(t, "before:2026-05-02 after:2026-02-03", got)
+}
+
+func TestFilterByDate_range(t *testing.T) {
+	// Timestamps in UTC (Matrix stores timestamps in UTC)
+	ts1 := time.Date(2021, 6, 1, 12, 0, 0, 0, time.UTC)  // May 20, 2021 12:00 UTC
+	ts2 := time.Date(2023, 1, 15, 12, 0, 0, 0, time.UTC) // May 19, 2023 12:00 UTC
+
+	before20220601 := time.Date(2022, 6, 1, 0, 0, 0, 0, localLoc)  // before June 1 00:00 local
+	after20200501 := time.Date(2020, 5, 1, 0, 0, 0, 0, localLoc)   // after May 1 00:00 local
+
+	hits := []*search.DocumentMatch{
+		{
+			Fields: map[string]any{
+				"event_id":  "evt1",
+				"room_id":   "room1",
+				"user_id":   "@alice:example.org",
+				"timestamp": float64(ts1.UnixMilli()),
+			},
+		},
+		{
+			Fields: map[string]any{
+				"event_id":  "evt2",
+				"room_id":   "room1",
+				"user_id":   "@bob:example.org",
+				"timestamp": float64(ts2.UnixMilli()),
+			},
+		},
+	}
+
+	// before 2022-06-01 local — ts1 (2021-06-01) should be included
+	result := filterHitsByUserAndRoom(hits, SearchArgs{BeforeDate: &before20220601})
+	assert.Equal(t, 1, len(result))
+	assert.Equal(t, "evt1", result[0].EventID)
+
+	// after 2020-05-01 local — ts1 (2021-06-01) should be included
+	result = filterHitsByUserAndRoom(hits, SearchArgs{AfterDate: &after20200501})
+	assert.Equal(t, 2, len(result))
+	assert.Equal(t, "evt1", result[0].EventID)
+	assert.Equal(t, "evt2", result[1].EventID)
+
+	// before 2022-06-01 AND after 2020-05-01 local — ts1 (2021-06-01) should be included
+	result = filterHitsByUserAndRoom(hits, SearchArgs{BeforeDate: &before20220601, AfterDate: &after20200501})
+	assert.Equal(t, 1, len(result))
+	assert.Equal(t, "evt1", result[0].EventID)
+
+	// before 2021-01-01 local — ts1 (2021-06-01) should be excluded (after the date)
+	before20210101 := time.Date(2021, 1, 1, 0, 0, 0, 0, localLoc)
+	result = filterHitsByUserAndRoom(hits, SearchArgs{BeforeDate: &before20210101})
+	assert.Equal(t, 0, len(result))
 }
 
 func TestFormatSemanticResults_no_results(t *testing.T) {

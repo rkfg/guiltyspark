@@ -2,12 +2,16 @@ package bot
 
 import (
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/rkfg/guiltyspark/indexer"
 	"github.com/rkfg/guiltyspark/search"
 )
+
+var localLoc, _ = time.LoadLocation("Local")
 
 var commandAliases = map[string][]string{
 	"search":          {"s", "ы", "find", "искать", "поиск", "п", "g"},
@@ -20,11 +24,12 @@ func HelpText() string {
 	commands := []struct {
 		name        string
 		description string
+		format      string
 	}{
-		{"search", "Exact text search"},
-		{"search-semantic", "Semantic (vector) similarity search"},
-		{"stats", "Show index statistics"},
-		{"help", "Show this help message"},
+		{"search", "Exact text search", "search <query> #room:server.org [user:<user_id>] [before:YYYY-MM-DD] [after:YYYY-MM-DD]"},
+		{"search-semantic", "Semantic (vector) similarity search", "semantic <query> #room:server.org [user:<user_id>] [before:YYYY-MM-DD] [after:YYYY-MM-DD]"},
+		{"stats", "Show index statistics", "stats"},
+		{"help", "Show this help message", "help"},
 	}
 
 	var sb strings.Builder
@@ -36,9 +41,12 @@ func HelpText() string {
 			for i, a := range aliases {
 				aliasStrs[i] = "!" + a
 			}
-			fmt.Fprintf(&sb, "!%s — %s (aliases: %s)\n", cmd.name, cmd.description, strings.Join(aliasStrs, ", "))
+			fmt.Fprintf(&sb, "!%s — %s\n", cmd.name, cmd.description)
+			fmt.Fprintf(&sb, "  format: %s\n", cmd.format)
+			fmt.Fprintf(&sb, "  aliases: %s\n", strings.Join(aliasStrs, ", "))
 		} else {
 			fmt.Fprintf(&sb, "!%s — %s\n", cmd.name, cmd.description)
+			fmt.Fprintf(&sb, "  format: %s\n", cmd.format)
 		}
 	}
 	return sb.String()
@@ -85,34 +93,55 @@ type CommandArgs struct {
 	Query      string
 	RoomFilter string
 	UserFilter string
+	BeforeDate *time.Time
+	AfterDate  *time.Time
 }
+
+func (ca *CommandArgs) toSearchArgs() search.SearchArgs {
+	return search.SearchArgs{
+		RoomID:     ca.RoomFilter,
+		UserFilter: ca.UserFilter,
+		BeforeDate: ca.BeforeDate,
+		AfterDate:  ca.AfterDate,
+	}
+}
+
+var (
+	userRegex    = regexp.MustCompile(`user:\s*(@\S+)`)
+	beforeRegex  = regexp.MustCompile(`before:\s*(\d{4}-\d{2}-\d{2})`)
+	afterRegex   = regexp.MustCompile(`after:\s*(\d{4}-\d{2}-\d{2})`)
+)
 
 func ParseCommandArgs(args string) (*CommandArgs, error) {
 	ca := &CommandArgs{}
 
-	parts := strings.Split(args, " ")
-
-	for i := 0; i < len(parts); i++ {
-		part := strings.TrimSpace(parts[i])
-		if part == "" {
-			continue
+	// Extract date filters from the query
+	if matches := beforeRegex.FindStringSubmatch(args); len(matches) > 1 {
+		if d, err := time.ParseInLocation("2006-01-02", matches[1], localLoc); err == nil {
+			ca.BeforeDate = &d
 		}
-		switch part {
-		case "--user":
-			if i+1 < len(parts) {
-				ca.UserFilter = strings.TrimSpace(parts[i+1])
-				i++
-			}
-		default:
-			if ca.Query == "" {
-				ca.Query = part
-			} else {
-				ca.Query += " " + part
-			}
+	}
+	if matches := afterRegex.FindStringSubmatch(args); len(matches) > 1 {
+		if d, err := time.ParseInLocation("2006-01-02", matches[1], localLoc); err == nil {
+			ca.AfterDate = &d
 		}
 	}
 
-	ca.Query = strings.TrimSpace(ca.Query)
+	// Extract user filter from the query
+	if matches := userRegex.FindStringSubmatch(args); len(matches) > 1 {
+		ca.UserFilter = strings.TrimSpace(matches[1])
+	}
+
+	// Remove all filter patterns from the query to get the raw query text
+	queryText := beforeRegex.ReplaceAllString(args, "")
+	queryText = afterRegex.ReplaceAllString(queryText, "")
+	queryText = userRegex.ReplaceAllString(queryText, "")
+	// Remove room links (they don't affect the query text)
+	queryText = regexp.MustCompile(`[#!]?\S*:\S+`).ReplaceAllString(queryText, "")
+	// Normalize whitespace
+	queryText = regexp.MustCompile(`\s+`).ReplaceAllString(queryText, " ")
+
+	ca.Query = strings.TrimSpace(queryText)
 
 	if ca.Query == "" {
 		return nil, fmt.Errorf("no query provided")
@@ -124,7 +153,7 @@ func ParseCommandArgs(args string) (*CommandArgs, error) {
 func (h *CommandHandler) HandleSearch(args string, roomID string, userFilter string, lastUsedRoom string) (string, string, error) {
 	ca, err := ParseCommandArgs(args)
 	if err != nil {
-		return "Usage: !search <query> #room:server.org", "", nil
+		return "Usage: !search <query> #room:server.org [user:<user_id>] [before:YYYY-MM-DD] [after:YYYY-MM-DD]", "", nil
 	}
 
 	// Room filter is REQUIRED for search
@@ -134,13 +163,15 @@ func (h *CommandHandler) HandleSearch(args string, roomID string, userFilter str
 	if roomID == "" {
 		return "Error: You must specify a room to search. Use a room alias like #room:server.org", "", nil
 	}
-	
-	// Merge user filter from HTML with --user arg
+
+	// Merge user filter from HTML with user: arg
 	if userFilter != "" && ca.UserFilter == "" {
 		ca.UserFilter = userFilter
 	}
+	ca.RoomFilter = roomID
 
-	result, err := h.searchEngine.ExactSearch(ca.Query, roomID, ca.UserFilter)
+	searchArgs := ca.toSearchArgs()
+	result, err := h.searchEngine.ExactSearch(ca.Query, searchArgs)
 	if err != nil {
 		return fmt.Sprintf("Search error: %v", err), "", err
 	}
@@ -152,7 +183,7 @@ func (h *CommandHandler) HandleSearch(args string, roomID string, userFilter str
 func (h *CommandHandler) HandleSemanticSearch(args string, roomID string, userFilter string, lastUsedRoom string) (string, string, error) {
 	ca, err := ParseCommandArgs(args)
 	if err != nil {
-		return "Usage: !semantic <query> #room:server.org", "", nil
+		return "Usage: !semantic <query> #room:server.org [user:<user_id>] [before:YYYY-MM-DD] [after:YYYY-MM-DD]", "", nil
 	}
 
 	// Room filter is REQUIRED for semantic search
@@ -162,13 +193,15 @@ func (h *CommandHandler) HandleSemanticSearch(args string, roomID string, userFi
 	if roomID == "" {
 		return "Error: You must specify a room to search. Use a room alias like #room:server.org", "", nil
 	}
-	
-	// Merge user filter from HTML with --user arg
+
+	// Merge user filter from HTML with user: arg
 	if userFilter != "" && ca.UserFilter == "" {
 		ca.UserFilter = userFilter
 	}
+	ca.RoomFilter = roomID
 
-	result, err := h.searchEngine.SemanticSearch(ca.Query, roomID, ca.UserFilter)
+	searchArgs := ca.toSearchArgs()
+	result, err := h.searchEngine.SemanticSearch(ca.Query, searchArgs)
 	if err != nil {
 		return fmt.Sprintf("Semantic search error: %v", err), "", err
 	}
