@@ -128,7 +128,7 @@ func (p *ImageProcessor) convertImage(data []byte, outputPath string) error {
 	defer os.Remove(inputFile)
 
 	args := []string{
-		inputFile,
+		inputFile + "[0]",
 		"-strip", "-interlace", "Plane", "-colorspace", "sRGB",
 		"-quality", fmt.Sprintf("%d", p.cfg.OutputQuality),
 	}
